@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtop"
+version = "0.0.1"
+authors = [
+  { name="Shamus Li", email="shamus@cs.cornell.edu" },
+]
+description = "A tool to display SLURM cluster usage with detailed node and resource information."
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License", # Choose a license
+    "Operating System :: OS Independent",
+]
+# Add your python script's dependencies here
+dependencies = [
+    "rich",
+]
+
+[project.scripts]
+gtop = "gtop:main"
