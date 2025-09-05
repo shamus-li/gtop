@@ -5,8 +5,8 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-GTOP = "sacct -X --format=User%10,partition%30,NodeList%30,State,AllocTRES%80,Jobid -a --units=G | grep RUNNING | grep billing"
-SINFO = 'sinfo -O nodehost:100,gres:100,cpusstate,allocmem,memory -h -e'
+GTOP = "sacct -X --format=User%10,partition%40,NodeList%40,State,AllocTRES%120,Jobid -a --units=G | grep RUNNING | grep billing"
+SINFO = 'sinfo -O nodehost:100,gres:100,cpusstate:100,allocmem:100,memory:100 -h -e'
 
 RESOURCES = ["cpu", "gpu", "mem"]
 PARTITIONS = ["priority", "default"]
@@ -87,6 +87,7 @@ def parse_mem(alloc_mem: str, total_mem: str) -> Dict[str, int]:
 
 
 def parse_usage(alloc_tres: str) -> Dict[str, float]:
+    print(alloc_tres)
     usage = {r: 0.0 for r in RESOURCES}
     for res in RESOURCES:
         if res in alloc_tres:
