@@ -87,7 +87,6 @@ def parse_mem(alloc_mem: str, total_mem: str) -> Dict[str, int]:
 
 
 def parse_usage(alloc_tres: str) -> Dict[str, float]:
-    print(alloc_tres)
     usage = {r: 0.0 for r in RESOURCES}
     for res in RESOURCES:
         if res in alloc_tres:
