@@ -21,5 +21,11 @@ dependencies = [
     "rich",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-cov",
+]
+
 [project.scripts]
 gtop = "gtop:main"
