@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""
-Integration test for gtop using real sinfo and gtop output data
-"""
+"""Integration-oriented tests for gtop parsing helpers."""
 
-from gtop import parse_gpu
+from pathlib import Path
+
+from gtop import parse_gpu, parse_sinfo, process_jobs
+
+
+FIXTURE_DIR = Path(__file__).resolve().parent
+
+
+def read_fixture(name: str) -> str:
+    return (FIXTURE_DIR / name).read_text()
 
 
 def test_klara_regular_gpu():
@@ -78,3 +85,53 @@ def test_sinfo_parsing_sample():
         assert node_name == "dutta-compute-01"
         assert gpu_result["num"] == 2
         assert gpu_result["shards"] == 48
+
+
+def test_parse_sinfo_unicorn_nodes():
+    """Ensure unicorn sinfo fixture is parsed correctly."""
+
+    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"), gpu_only=False)
+
+    assert "klara" in servers
+    assert servers["klara"]["gpu"]["num"] == 8
+    assert "unicorn-compute-01" in servers
+    assert servers["unicorn-compute-01"]["gpu"]["type"].count("|") == 1
+
+
+def test_parse_sinfo_g2_fixed_width():
+    """g2 sinfo output uses fixed-width columns without whitespace delimiters."""
+
+    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=False)
+
+    # CPU-only nodes should still be present when gpu_only is False
+    assert "g2-cpu-28" in servers
+    assert servers["g2-cpu-28"]["gpu"]["num"] == 0
+
+    # GPU nodes preserve their GPU counts
+    assert "badfellow" in servers
+    assert servers["badfellow"]["gpu"]["num"] == 4
+
+
+def test_parse_sinfo_g2_gpu_only_filters_cpu_nodes():
+    """The gpu_only flag should remove nodes with null GRES entries."""
+
+    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=True)
+    assert "g2-cpu-28" not in servers
+    assert any(info["gpu"]["num"] > 0 for info in servers.values())
+
+
+def test_process_jobs_applies_gpu_usage_split():
+    """Processing sacct output should attribute GPU usage to nodes."""
+
+    sinfo = read_fixture("sinfo-output-g2.txt")
+    servers = parse_sinfo(sinfo, gpu_only=False)
+    gtop_output = read_fixture("gtop-output-g2.txt")
+
+    process_jobs(gtop_output, servers)
+
+    badfellow = servers["badfellow"]["usage"]["gpu"]
+    assert badfellow["priority"] == 2.0
+    assert badfellow["default"] == 3.0
+
+    # CPU nodes should keep zero GPU usage even after processing
+    assert servers["g2-cpu-29"]["usage"]["gpu"]["default"] == 0

@@ -267,9 +267,36 @@ def parse_sinfo(output: str, gpu_only: bool) -> Dict[str, Dict]:
     """Parse sinfo output with enhanced GPU support including MIG and sharded GPUs."""
     servers = {}
     for line in output.strip().split("\n"):
-        parts = line.split()
-        if len(parts) < 6:
+        line = line.rstrip()
+        if not line:
             continue
+
+        parts = line.split()
+
+        if len(parts) < 6:
+            # Fallback to fixed-width parsing (sinfo -O field:100)
+            field_width = 100
+            field_count = 6
+            fields: List[str] = []
+            start = 0
+            line_len = len(line)
+
+            for idx in range(field_count - 1):
+                end = start + field_width
+                if start >= line_len:
+                    fields.append("")
+                else:
+                    fields.append(line[start:end].strip())
+                start = end
+
+            # Remainder of the line is the final field
+            fields.append(line[start:].strip() if start <= line_len else "")
+
+            # Only use fallback if we extracted the expected number of fields
+            if len(fields) >= field_count and any(fields):
+                parts = fields[:field_count]
+            else:
+                continue
 
         # Updated to handle gresused field
         node_name, gres, gres_used, cpu_state, alloc_mem, total_mem = parts[:6]
