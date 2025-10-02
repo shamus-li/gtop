@@ -6,9 +6,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-GTOP = "sacct -X --format=User%10,partition%40,NodeList%40,State,AllocTRES%120,Jobid -a --units=G | grep RUNNING"
-SINFO = "sinfo -O nodehost:100,gres:100,gresused:100,cpusstate:100,allocmem:100,memory:100 -h"
+GTOP_COMMAND = "sacct -X --format=User%10,partition%40,NodeList%40,State,AllocTRES%120,Jobid -a --units=G | grep RUNNING"
+SINFO_COMMAND = (
+    "sinfo -O "
+    "nodehost:100,features:200,gres:256,gresused:256,cpusstate:100,allocmem:100,memory:100 "
+    "-h"
+)
+
+SINFO_FIELD_WIDTHS = [100, 200, 256, 256, 100, 100, 100]
 
 RESOURCES = ["cpu", "gpu", "mem"]
 PARTITIONS = ["priority", "default"]
@@ -99,9 +106,123 @@ def parse_nodelist(nodelist: str) -> List[str]:
     return result
 
 
+def parse_features_field(features: str) -> Set[str]:
+    """Turn the sinfo features column into a normalized set."""
+    if not features:
+        return set()
+
+    feature_list = []
+    for raw in features.replace("|", ",").split(","):
+        cleaned = raw.strip().lower()
+        if not cleaned or cleaned == "(null)":
+            continue
+
+        base_feature = cleaned.split("*", 1)[0].strip()
+        if base_feature:
+            feature_list.append(base_feature)
+    return set(feature_list)
+
+
+def _tokenize_constraint(expr: str) -> List[str]:
+    tokens: List[str] = []
+    i = 0
+    length = len(expr)
+
+    while i < length:
+        ch = expr[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "()&|":
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            tokens.append("(")
+            i += 1
+            continue
+        if ch == "]":
+            tokens.append(")")
+            i += 1
+            continue
+
+        start = i
+        while i < length and expr[i] not in "()&|[] " and not expr[i].isspace():
+            i += 1
+        tokens.append(expr[start:i])
+
+    return tokens
+
+
+def matches_constraint(features: Set[str], constraint: str) -> bool:
+    """Evaluate a SLURM-style constraint expression against node features.
+
+    This implements left-to-right evaluation for `&` and `|`, matching SLURM's
+    documented behaviour when parentheses are not provided. Square brackets are
+    treated as parentheses for Filtering purposes. Multipliers (e.g., foo*2) are
+    ignored for single-node checks.
+    """
+
+    if not constraint:
+        return True
+
+    tokens = _tokenize_constraint(constraint.lower())
+
+    if not tokens:
+        return True
+
+    position = 0
+
+    def parse_term() -> bool:
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError("Unexpected end of constraint expression")
+
+        token = tokens[position]
+        if token == "(":
+            position += 1
+            value = parse_expression()
+            if position >= len(tokens) or tokens[position] != ")":
+                raise ValueError("Unmatched parenthesis in constraint expression")
+            position += 1
+            return value
+
+        if token in {"&", "|", ")"}:
+            raise ValueError(f"Unexpected token '{token}' in constraint expression")
+
+        position += 1
+        feature_name = token.split("*", 1)[0]
+        feature_name = feature_name.strip()
+        return feature_name in features
+
+    def parse_expression() -> bool:
+        nonlocal position
+        value = parse_term()
+        while position < len(tokens) and tokens[position] in {"&", "|"}:
+            op = tokens[position]
+            position += 1
+            rhs = parse_term()
+            if op == "&":
+                value = value and rhs
+            else:
+                value = value or rhs
+        return value
+
+    try:
+        result = parse_expression()
+        if position != len(tokens):
+            raise ValueError("Trailing tokens in constraint expression")
+        return result
+    except ValueError as error:
+        stderr_console.print(
+            f"[red]Failed to evaluate constraint '{constraint}': {error}[/]"
+        )
+        return False
+
+
 def parse_gpu(gres: str, gres_used: str = "") -> Dict[str, Any]:
     """Parse GPU information including MIG and sharded GPU support."""
-    if "null" in gres or not gres:
+    if not gres or gres.strip().lower() in {"(null)", "null", "none"}:
         return {"type": "null", "num": 0, "mig_instances": [], "shards": 0, "used": 0}
 
     types, total, mig_instances, shards = [], 0, [], 0
@@ -181,7 +302,7 @@ def parse_gpu(gres: str, gres_used: str = "") -> Dict[str, Any]:
             )
 
     # Parse used GRES if provided
-    if gres_used:
+    if gres_used and gres_used.strip().lower() not in {"(null)", "null", "none"}:
         for item in gres_used.split(","):
             parts = item.split(":")
             if len(parts) >= 2 and parts[0].startswith("gpu"):
@@ -226,10 +347,26 @@ def parse_cpu(cpu_state: str) -> Dict[str, int]:
     return {"idle": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0}
 
 
-def parse_mem(alloc_mem: str, total_mem: str) -> Dict[str, int]:
-    alloc = int(alloc_mem) if alloc_mem.isdigit() else 0
-    total = int(total_mem) if total_mem.isdigit() else 0
-    return {"idle": total - alloc, "total": total}
+def _parse_numeric(value: str) -> float:
+    if not value:
+        return 0.0
+
+    lowered = value.strip().lower()
+    if lowered in {"(null)", "none"}:
+        return 0.0
+
+    cleaned = "".join(c for c in value if c.isdigit() or c == ".")
+    try:
+        return float(cleaned) if cleaned else 0.0
+    except ValueError:
+        return 0.0
+
+
+def parse_mem(alloc_mem: str, total_mem: str) -> Dict[str, float]:
+    alloc = _parse_numeric(alloc_mem)
+    total = _parse_numeric(total_mem)
+    idle = max(total - alloc, 0.0)
+    return {"idle": idle, "total": total}
 
 
 def parse_usage(alloc_tres: str) -> Dict[str, float]:
@@ -263,43 +400,41 @@ def parse_usage(alloc_tres: str) -> Dict[str, float]:
     return usage
 
 
+def _split_sinfo_line(line: str) -> Optional[List[str]]:
+    if not line:
+        return None
+
+    if "|" in line:
+        parts = [segment.strip() for segment in line.split("|")]
+        return parts if len(parts) >= 7 else None
+
+    fields: List[str] = []
+    start = 0
+    for width in SINFO_FIELD_WIDTHS:
+        end = start + width
+        fields.append(line[start:end].strip())
+        start = end
+
+    return fields if len(fields) >= 7 else None
+
+
 def parse_sinfo(output: str, gpu_only: bool) -> Dict[str, Dict]:
     """Parse sinfo output with enhanced GPU support including MIG and sharded GPUs."""
     servers = {}
-    for line in output.strip().split("\n"):
-        line = line.rstrip()
-        if not line:
+    for raw_line in output.strip().split("\n"):
+        line = raw_line.rstrip("\n")
+        if not line.strip():
             continue
 
-        parts = line.split()
+        parts = _split_sinfo_line(line)
+        if not parts:
+            continue
 
-        if len(parts) < 6:
-            # Fallback to fixed-width parsing (sinfo -O field:100)
-            field_width = 100
-            field_count = 6
-            fields: List[str] = []
-            start = 0
-            line_len = len(line)
+        node_name, features_raw, gres, gres_used, cpu_state, alloc_mem, total_mem = (
+            parts[:7]
+        )
 
-            for idx in range(field_count - 1):
-                end = start + field_width
-                if start >= line_len:
-                    fields.append("")
-                else:
-                    fields.append(line[start:end].strip())
-                start = end
-
-            # Remainder of the line is the final field
-            fields.append(line[start:].strip() if start <= line_len else "")
-
-            # Only use fallback if we extracted the expected number of fields
-            if len(fields) >= field_count and any(fields):
-                parts = fields[:field_count]
-            else:
-                continue
-
-        # Updated to handle gresused field
-        node_name, gres, gres_used, cpu_state, alloc_mem, total_mem = parts[:6]
+        features = parse_features_field(features_raw)
 
         gpu = parse_gpu(gres, gres_used)
         if gpu_only and gpu["type"] == "null":
@@ -310,6 +445,7 @@ def parse_sinfo(output: str, gpu_only: bool) -> Dict[str, Dict]:
 
         for server in parse_nodelist(node_name):
             servers[server] = {
+                "features": features,
                 "gpu": gpu,
                 "cpu": cpu,
                 "mem": mem,
@@ -392,7 +528,7 @@ def process_jobs(gtop_output: str, servers: Dict[str, Dict]) -> None:
         stderr_console.print(f"[dim]Processed {processed_jobs} job allocations[/]")
 
 
-def format_resource(info: Dict, res: str) -> str:
+def format_resource(info: Dict, res: str, disp_shard: bool = False) -> str:
     """Format resource usage with improved handling for MIG and sharded GPUs."""
     priority = info["usage"][res].get("priority", 0)
     default = info["usage"][res].get("default", 0)
@@ -409,8 +545,8 @@ def format_resource(info: Dict, res: str) -> str:
             used = gpu_info.get("used", 0)
             idle = total - used
             return f"{used}/{idle} (MIG)"
-        # For sharded GPUs, show shard allocation
-        elif gpu_info.get("shards", 0) > 0:
+        # For sharded GPUs, show shard allocation only if --disp-shard is enabled
+        elif disp_shard and gpu_info.get("shards", 0) > 0:
             used = priority + default
             idle = gpu_info["shards"] - used
             return f"{int(priority)}/{int(default)}/{int(idle)}"
@@ -422,17 +558,37 @@ def format_resource(info: Dict, res: str) -> str:
         return f"{int(priority):3d}/{int(default):3d}/{int(idle):3d}"
 
 
+def sort_server_names(servers: Dict[str, Dict], sort_by: str) -> List[str]:
+    """Return server names sorted according to the requested strategy."""
+
+    if sort_by == "feature":
+
+        def sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple[str, str]:
+            name, info = item
+            features = info.get("features") or set()
+            feature_repr = ",".join(sorted(features)) if features else ""
+            return (feature_repr, name)
+
+        return [name for name, _ in sorted(servers.items(), key=sort_key)]
+
+    return sorted(servers.keys())
+
+
 def create_main_table(
-    servers: Dict[str, Dict], target_users: Optional[Set[str]], disp_users: bool
+    servers: Dict[str, Dict],
+    target_users: Optional[Set[str]],
+    disp_users: bool,
+    sort_by: str,
+    disp_shard: bool = False,
 ) -> Table:
     table = Table(box=box.ROUNDED)
     table.add_column("Server", style="bright_cyan", no_wrap=True)
-    table.add_column("GPU", style="yellow")
+    table.add_column("GPU", style="yellow", overflow="fold")
     table.add_column("CPU (P/D/I)", style="green", justify="center")
     table.add_column("GPU (P/D/I)", style="magenta", justify="center")
     table.add_column("Memory GB (P/D/I)", style="blue", justify="center")
 
-    for server in sorted(servers.keys()):
+    for server in sort_server_names(servers, sort_by):
         info = servers[server]
 
         if target_users:
@@ -449,8 +605,8 @@ def create_main_table(
             for inst in gpu_data["mig_instances"]:
                 mig_details.append(f"{inst['count']}x{inst['type']}")
             gpu_info = f"MIG: {', '.join(mig_details)}"
-        elif gpu_data.get("shards", 0) > 0:
-            # Show the underlying GPU type being sharded
+        elif disp_shard and gpu_data.get("shards", 0) > 0:
+            # Show the underlying GPU type being sharded only if --disp-shard is enabled
             gpu_type = gpu_data["type"]
             if (
                 gpu_type.startswith("Shard(")
@@ -462,16 +618,42 @@ def create_main_table(
             else:
                 gpu_info = f"{gpu_data['shards']} shards ({gpu_data['num']} total)"
         else:
-            gpu_info = f"{gpu_data['num']} x {gpu_data['type']}"
+            # Default: show GPU count regardless of sharding
+            gpu_type = gpu_data["type"]
+            # Extract base GPU type if it's in Shard() format
+            if gpu_type.startswith("Shard(") and gpu_type.endswith(")"):
+                base_type = gpu_type[6:-1]  # Remove 'Shard(' and ')'
+                gpu_info = f"{gpu_data['num']} x {base_type}"
+            else:
+                gpu_info = f"{gpu_data['num']} x {gpu_data['type']}"
+
+        # Calculate idle GPUs to determine row color
+        priority = info["usage"]["gpu"].get("priority", 0)
+        default = info["usage"]["gpu"].get("default", 0)
+        total_gpus = (
+            gpu_data.get("shards", 0)
+            if disp_shard and gpu_data.get("shards", 0) > 0
+            else gpu_data["num"]
+        )
+        idle_gpus = total_gpus - priority - default
+
+        # Determine row style based on idle GPU count
+        if idle_gpus >= 1:
+            row_style = "green"
+        elif idle_gpus <= 0:
+            row_style = "red"
+        else:
+            row_style = None
+
         row_data = [
             server,
-            gpu_info,
-            format_resource(info, "cpu"),
-            format_resource(info, "gpu"),
-            format_resource(info, "mem"),
+            Text(gpu_info, overflow="fold"),
+            format_resource(info, "cpu", disp_shard),
+            format_resource(info, "gpu", disp_shard),
+            format_resource(info, "mem", disp_shard),
         ]
 
-        table.add_row(*row_data)
+        table.add_row(*row_data, style=row_style)
 
         if disp_users and info["users"]:
             jobs_table = Table(box=box.SIMPLE, show_header=True, padding=(0, 2))
@@ -531,11 +713,16 @@ def print_summary(
         for job in jobs:
             user = job["user"]
             if user in target_users:
+                job_nodes = parse_nodelist(job["nodelist"])
+                matched_nodes = [node for node in job_nodes if node in servers]
+                if not matched_nodes:
+                    continue
+
                 usage = parse_usage(job["usage_str"])
                 gpus = int(usage.get("gpu", 0))
                 partition = job["partition"]
 
-                for node in parse_nodelist(job["nodelist"]):
+                for node in matched_nodes:
                     user_stats[user]["nodes"].add(node)
 
                 current = user_stats[user]["gpus_by_partition"].get(partition, 0)
@@ -603,13 +790,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Display SLURM cluster usage with detailed node and resource information"
     )
-    parser.add_argument(
-        "--gpu-only", action="store_true", help="Only show nodes with GPUs"
-    )
+    parser.add_argument("--gpu", action="store_true", help="Only show nodes with GPUs")
     parser.add_argument(
         "--disp-users", action="store_true", help="Display detailed per-job usage"
     )
     parser.add_argument("--users", nargs="+", help="Filter by user netids")
+    parser.add_argument(
+        "--constraint",
+        help="Filter nodes by features matching the constraint expression (e.g., gpu-high)",
+    )
     parser.add_argument(
         "--mig-info",
         action="store_true",
@@ -621,6 +810,17 @@ def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Enable debug output for troubleshooting"
     )
+    parser.add_argument(
+        "--sort",
+        choices=["name", "feature"],
+        default="feature",
+        help="Sort the node list by the specified attribute",
+    )
+    parser.add_argument(
+        "--shard",
+        action="store_true",
+        help="Display sharded GPU information instead of total GPU count",
+    )
 
     args = parser.parse_args()
     target_users = set(args.users) if args.users else None
@@ -631,15 +831,15 @@ def main() -> None:
 
     # Execute SLURM commands in parallel for better performance
     if not args.no_parallel:
-        commands = [("sinfo", SINFO), ("gtop", GTOP)]
+        commands = [("sinfo", SINFO_COMMAND), ("gtop", GTOP_COMMAND)]
 
         results = exec_commands_parallel(commands)
         sinfo_output = results.get("sinfo", "")
         gtop_output = results.get("gtop", "")
     else:
         # Sequential execution for debugging or compatibility
-        sinfo_output = exec_cmd(SINFO)
-        gtop_output = exec_cmd(GTOP)
+        sinfo_output = exec_cmd(SINFO_COMMAND)
+        gtop_output = exec_cmd(GTOP_COMMAND)
 
     if not sinfo_output:
         console.print(
@@ -656,7 +856,23 @@ def main() -> None:
             f"[dim]gtop returned {len(gtop_output.splitlines()) if gtop_output else 0} lines[/]"
         )
 
-    servers = parse_sinfo(sinfo_output, args.gpu_only)
+    servers = parse_sinfo(sinfo_output, args.gpu)
+
+    if args.constraint:
+        constraint_expr = args.constraint.strip()
+        filtered_servers = {
+            name: info
+            for name, info in servers.items()
+            if matches_constraint(info.get("features", set()), constraint_expr)
+        }
+
+        if not filtered_servers:
+            console.print(
+                f"[yellow]No servers found matching constraint '{constraint_expr}'.[/]"
+            )
+            return
+
+        servers = filtered_servers
 
     if not servers:
         console.print("[yellow]No servers found matching the criteria.[/]")
@@ -686,7 +902,9 @@ def main() -> None:
     if args.mig_info:
         print_mig_summary(servers)
 
-    table = create_main_table(servers, target_users, args.disp_users)
+    table = create_main_table(
+        servers, target_users, args.disp_users, args.sort, args.shard
+    )
     console.print(table)
 
 

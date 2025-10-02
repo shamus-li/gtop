@@ -3,7 +3,15 @@
 
 from pathlib import Path
 
-from gtop import parse_gpu, parse_sinfo, process_jobs
+from gtop import (
+    matches_constraint,
+    parse_features_field,
+    parse_gpu,
+    parse_sinfo,
+    process_jobs,
+    sort_server_names,
+    SINFO_FIELD_WIDTHS,
+)
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent
@@ -11,6 +19,25 @@ FIXTURE_DIR = Path(__file__).resolve().parent
 
 def read_fixture(name: str) -> str:
     return (FIXTURE_DIR / name).read_text()
+
+
+def test_matches_constraint_basic_boolean_logic():
+    features = {"gpu", "gpu-high", "intel"}
+
+    assert matches_constraint(features, "gpu")
+    assert matches_constraint(features, "gpu&gpu-high")
+    assert matches_constraint(features, "gpu|amd")
+    assert matches_constraint(features, "[gpu-high|gpu-low]")
+    assert matches_constraint(features, "gpu-high*2")
+    assert not matches_constraint(features, "amd")
+    assert not matches_constraint(features, "gpu-high&amd")
+
+
+def test_matches_constraint_parentheses_respected():
+    features = {"gpu", "gpu-legacy", "amd"}
+
+    assert matches_constraint(features, "gpu|(cpu&amd)")
+    assert not matches_constraint(features, "(cpu&amd)|gpu-high")
 
 
 def test_klara_regular_gpu():
@@ -96,6 +123,8 @@ def test_parse_sinfo_unicorn_nodes():
     assert servers["klara"]["gpu"]["num"] == 8
     assert "unicorn-compute-01" in servers
     assert servers["unicorn-compute-01"]["gpu"]["type"].count("|") == 1
+    assert "gpu" in servers["unicorn-compute-01"]["features"]
+    assert "gpu-high" in servers["klara"]["features"]
 
 
 def test_parse_sinfo_g2_fixed_width():
@@ -110,14 +139,29 @@ def test_parse_sinfo_g2_fixed_width():
     # GPU nodes preserve their GPU counts
     assert "badfellow" in servers
     assert servers["badfellow"]["gpu"]["num"] == 4
+    assert "gpu-high" in servers["badfellow"]["features"]
 
 
-def test_parse_sinfo_g2_gpu_only_filters_cpu_nodes():
-    """The gpu_only flag should remove nodes with null GRES entries."""
+def test_parse_sinfo_g2_gpu_filters_cpu_nodes():
+    """The gpu flag should remove nodes with null GRES entries."""
 
     servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=True)
     assert "g2-cpu-28" not in servers
     assert any(info["gpu"]["num"] > 0 for info in servers.values())
+
+
+def test_constraint_filtering_with_fixture():
+    """Constraint expressions should narrow the server list as expected."""
+
+    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=False)
+
+    matching = [
+        name for name, info in servers.items() if matches_constraint(info["features"], "gpu-high")
+    ]
+
+    assert "sun-compute-01" in matching
+    assert "ma-compute-01" in matching
+    assert "g2-cpu-28" not in matching
 
 
 def test_process_jobs_applies_gpu_usage_split():
@@ -135,3 +179,47 @@ def test_process_jobs_applies_gpu_usage_split():
 
     # CPU nodes should keep zero GPU usage even after processing
     assert servers["g2-cpu-29"]["usage"]["gpu"]["default"] == 0
+
+
+def test_parse_features_field_strips_multipliers():
+    """Feature fields with SLURM multipliers should normalize to base names."""
+
+    result = parse_features_field("gpu-high*2, gpu-low*3, avx512")
+
+    assert "gpu-high" in result
+    assert "gpu-low" in result
+    assert "avx512" in result
+    assert all("*" not in feature for feature in result)
+
+
+def test_sort_server_names_by_feature_representation():
+    servers = {
+        "node-b": {"features": {"gpu-low"}},
+        "node-c": {"features": set()},
+        "node-a": {"features": {"gpu-high"}},
+    }
+
+    assert sort_server_names(servers, "feature") == ["node-c", "node-a", "node-b"]
+    assert sort_server_names(servers, "name") == ["node-a", "node-b", "node-c"]
+
+
+def test_parse_sinfo_fixed_width_line():
+    fields = [
+        "demo-node",
+        "gpu,gpu-high",
+        "gpu:nvidia_a100:4(S:0-1)",
+        "gpu:nvidia_a100:2(IDX:0-1)",
+        "10/22/0/32",
+        "2048",
+        "65536",
+    ]
+
+    segments = [
+        value.ljust(width) for value, width in zip(fields, SINFO_FIELD_WIDTHS)
+    ]
+    fixed_width_line = "".join(segments)
+
+    servers = parse_sinfo(fixed_width_line, gpu_only=False)
+    assert "demo-node" in servers
+    assert servers["demo-node"]["gpu"]["num"] == 4
+    assert servers["demo-node"]["mem"]["total"] == 65536

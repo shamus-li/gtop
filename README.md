@@ -23,9 +23,12 @@ ln -s GTOP_PATH ~/.local/bin/gtop   # replace GTOP_PATH with the output of `whic
 
 ```
 gtop                    # display stats about all nodes in the cluster
-gtop --gpu-only         # display stats only about nodes with gpus
+gtop --gpu              # display stats only about nodes with gpus
 gtop --disp-users       # include information which which specific jobs are using which resources
 gtop --users USER       # filter the results for specific user accounts
+gtop --constraint=GPU   # filter nodes whose features satisfy the constraint expression (e.g., gpu-high)
+gtop --sort name        # switch back to alphabetical sorting (default groups by feature)
+gtop --shard            # display sharded GPU information instead of total GPU count
 gtop --mig-info         # display detailed MIG (Multi-Instance GPU) information
 gtop --no-parallel      # disable parallel command execution (for debugging)
 gtop --debug            # enable debug output for troubleshooting usage calculation issues
@@ -34,10 +37,11 @@ gtop --debug            # enable debug output for troubleshooting usage calculat
 ## New Features
 
 ### Sharded GPU Support
-The tool now supports SLURM's sharded GPU functionality, allowing multiple jobs to share GPU resources:
-- Detects and displays the specific GPU type being sharded (e.g., `4 x a100 (Sharded)`)
-- Shows shard utilization with GPU type indicator: `priority/default/idle (S:GPU_TYPE)`
-- Falls back to generic display for unknown shard types: `priority/default/idle (S)`
+The tool supports SLURM's sharded GPU functionality, allowing multiple jobs to share GPU resources:
+- **Default behavior**: Shows the total number of physical GPUs available (e.g., `2 x nvidia_h100_nvl`)
+- **With `--shard` flag**: Displays shard counts and detailed sharding information
+  - Shows shard utilization as `priority/default/idle` based on shard count
+  - Displays GPU type being sharded (e.g., `48 x nvidia_h100_nvl (Sharded)`)
 
 ### MIG (Multi-Instance GPU) Support
 Enhanced support for NVIDIA MIG partitioned GPUs:

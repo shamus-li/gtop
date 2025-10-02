@@ -94,6 +94,14 @@ def test_null_gres():
     assert result["num"] == 0
 
 
+def test_none_gres():
+    """Test 'none' GRES values are treated as empty."""
+
+    result = parse_gpu("none")
+    assert result["type"] == "null"
+    assert result["num"] == 0
+
+
 def test_complex_shard_range():
     """Test complex shard ranges should not be considered sharded"""
     gres = "gpu:nvidia_geforce_gtx_titan_x:2(S:0,3)"
