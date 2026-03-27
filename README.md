@@ -1,6 +1,6 @@
 # gtop
 
-`gtop` shows live SLURM GPU usage on Cornell-style clusters.
+`gtop` is designed to show live SLURM GPU usage on Cornell University's G2 and Unicorn clusters.
 
 ## Install
 
