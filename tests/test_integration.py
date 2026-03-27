@@ -260,6 +260,18 @@ def test_sort_server_names_by_feature_representation():
     ]
 
 
+def test_sort_server_names_counts_gpu_partition_usage():
+    servers = {
+        "node-a": make_server("node-a", features={"gpu"}, gpu_num=4),
+        "node-b": make_server("node-b", features={"gpu"}, gpu_num=4),
+    }
+    servers["node-a"].usage["gpu"] = ResourceUsageSplit(gpu=3)
+    servers["node-b"].usage["gpu"] = ResourceUsageSplit(gpu=1)
+
+    assert sort_server_names(servers, "free-gpu") == ["node-b", "node-a"]
+    assert sort_server_names(servers, "used-gpu") == ["node-a", "node-b"]
+
+
 def test_parse_sinfo_fixed_width_line():
     fields = [
         "demo-node",

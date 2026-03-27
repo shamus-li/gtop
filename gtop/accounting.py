@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Sequence, Set
 
 from rich.text import Text
 
-from .constants import JOB_RESOURCE_NAMES
+from .constants import JOB_RESOURCE_NAMES, PARTITIONS
 from .models import (
     ClusterState,
     ClusterSummary,
@@ -39,6 +40,15 @@ def shard_equivalent(server: ServerState, gpu_count: float) -> float:
     if gpu_count <= 0 or server.gpu.shards <= 0 or server.gpu.num <= 0:
         return 0.0
     return gpu_count * (server.gpu.shards / server.gpu.num)
+
+
+def gpu_occupancy_equivalent(server: ServerState, shard_count: float) -> float:
+    if shard_count <= 0 or server.gpu.shards <= 0 or server.gpu.num <= 0:
+        return 0.0
+    shards_per_gpu = server.gpu.shards / server.gpu.num
+    if shards_per_gpu <= 0:
+        return 0.0
+    return float(min(server.gpu.num, math.ceil(shard_count / shards_per_gpu)))
 
 
 def process_jobs(
@@ -219,19 +229,31 @@ def build_cluster_summary(
     all_user_summaries: Dict[str, UserSummary] = {}
 
     for server in state.servers.values():
+        usage_by_user_partition: Dict[tuple[str, str], Dict[str, float]] = {}
         for job in server.users.values():
+            key = (job.netid, job.partition)
+            totals = usage_by_user_partition.setdefault(
+                key,
+                {"gpu": 0.0, "shard": 0.0, "explicit_shard": 0.0},
+            )
+            totals["gpu"] += job.gpu
+            totals["shard"] += job.shard
+            if job.gpu <= 0 and job.shard > 0:
+                totals["explicit_shard"] += job.shard
+
+        for (user, partition), totals in usage_by_user_partition.items():
             resource_count = int(
-                job.shard
-                if show_shards and server.gpu.shards > 0 and job.shard
-                else job.gpu
+                totals["shard"]
+                if show_shards and totals["shard"] > 0
+                else totals["gpu"] + gpu_occupancy_equivalent(server, totals["explicit_shard"])
             )
             if resource_count <= 0:
                 continue
-            user_summary = all_user_summaries.setdefault(job.netid, UserSummary())
+            user_summary = all_user_summaries.setdefault(user, UserSummary())
             user_summary.nodes.add(server.name)
-            current = user_summary.usage_by_partition.get(job.partition, 0)
-            user_summary.usage_by_partition[job.partition] = current + resource_count
-            bucket = partition_bucket(job.partition)
+            current = user_summary.usage_by_partition.get(partition, 0)
+            user_summary.usage_by_partition[partition] = current + resource_count
+            bucket = partition_bucket(partition)
             if bucket == "priority":
                 user_summary.priority_usage += resource_count
             elif bucket == "gpu":
@@ -286,15 +308,30 @@ def project_servers_for_users(
         projected_usage = {
             resource: ResourceUsageSplit() for resource in JOB_RESOURCE_NAMES
         }
+        gpu_usage_by_partition = {partition: 0.0 for partition in PARTITIONS}
+        explicit_shard_usage_by_partition = {partition: 0.0 for partition in PARTITIONS}
+        shard_usage_by_partition = {partition: 0.0 for partition in PARTITIONS}
         for job_id, job in server.users.items():
             if job.netid not in target_users:
                 continue
             projected_users[job_id] = job
             partition_type = partition_bucket(job.partition)
             projected_usage["cpu"].add(partition_type, job.cpu)
-            projected_usage["gpu"].add(partition_type, job.gpu)
             projected_usage["mem"].add(partition_type, job.mem)
             projected_usage["shard"].add(partition_type, job.shard)
+            gpu_usage_by_partition[partition_type] += job.gpu
+            shard_usage_by_partition[partition_type] += job.shard
+            if job.gpu <= 0 and job.shard > 0:
+                explicit_shard_usage_by_partition[partition_type] += job.shard
+        for partition_type in PARTITIONS:
+            projected_usage["gpu"].add(
+                partition_type,
+                gpu_usage_by_partition[partition_type]
+                + gpu_occupancy_equivalent(
+                    server,
+                    explicit_shard_usage_by_partition[partition_type],
+                ),
+            )
         projected_servers.append(
             ServerState(
                 name=server.name,

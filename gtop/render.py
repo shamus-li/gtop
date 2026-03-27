@@ -103,7 +103,7 @@ def _resource_totals(
         usage = server.usage["gpu"]
         total = float(server.gpu.num)
 
-    used = float(usage.priority) + float(usage.default)
+    used = float(usage.priority) + float(usage.gpu) + float(usage.default)
     return used, total
 
 
@@ -311,7 +311,11 @@ def _build_jobs_table(
         )
         for job in jobs
     ]
-    capacity = server.gpu.shards if show_shards and server.gpu.shards > 0 else server.gpu.num
+    use_shards = server.gpu.shards > 0 and (
+        show_shards or any(job.shard > 0 for job in records)
+    )
+    capacity = server.gpu.shards if use_shards else server.gpu.num
+    widths = _job_column_widths(records)
     return Group(
         _build_job_group_header(
             server.name,
@@ -320,8 +324,14 @@ def _build_jobs_table(
             gpu_type=_display_gpu_type(server, show_shards=show_shards),
             group_name_width=group_name_width,
             gpu_type_width=gpu_type_width,
+            node_gpu_units={server.name: "shard" if use_shards else "GPU"},
+            node_shards_per_gpu=(
+                {server.name: server.gpu.shards / server.gpu.num}
+                if use_shards and server.gpu.num > 0
+                else None
+            ),
         ),
-        _build_job_rows_table(records),
+        _build_job_rows_renderable(records, widths),
     )
 
 
@@ -356,6 +366,15 @@ def _job_gpu_count(job: JobRecord) -> int:
     return int(round(job.shard if job.shard > 0 else job.gpu))
 
 
+def _job_group_resource_count(job: JobRecord, *, shards_per_gpu: float | None) -> int:
+    if shards_per_gpu and shards_per_gpu > 0:
+        if job.shard > 0:
+            return int(round(job.shard))
+        if job.gpu > 0:
+            return int(round(job.gpu * shards_per_gpu))
+    return _job_gpu_count(job)
+
+
 def _job_group_name(job: JobRecord) -> str:
     if job.state.upper().startswith("PEND"):
         return "Pending / Unassigned"
@@ -365,27 +384,25 @@ def _job_group_name(job: JobRecord) -> str:
     return nodelist
 
 
-def _build_jobs_overview(jobs: Sequence[JobRecord], *, title: str) -> Table:
+def build_jobs_overview(jobs: Sequence[JobRecord], *, title: str) -> Text:
     running = sum(1 for job in jobs if job.state.upper().startswith("RUN"))
     pending = sum(1 for job in jobs if job.state.upper().startswith("PEND"))
     requeued = sum(1 for job in jobs if job.state.upper().startswith("REQ"))
 
-    table = Table.grid(padding=(0, 2), expand=False)
-    table.add_column(no_wrap=True)
-    table.add_column(no_wrap=True)
-    summary = Text()
-    summary.append(str(running), style="green")
-    summary.append(" running", style="white")
+    line = Text()
+    line.append(title, style="bold cyan")
+    line.append("  ")
+    line.append(str(running), style="green")
+    line.append(" running", style="white")
     if pending:
-        summary.append("  ")
-        summary.append(str(pending), style="yellow")
-        summary.append(" pending", style="white")
+        line.append("  ")
+        line.append(str(pending), style="yellow")
+        line.append(" pending", style="white")
     if requeued:
-        summary.append("  ")
-        summary.append(str(requeued), style="magenta")
-        summary.append(" requeued", style="white")
-    table.add_row(Text(title, style="bold cyan"), summary)
-    return table
+        line.append("  ")
+        line.append(str(requeued), style="magenta")
+        line.append(" requeued", style="white")
+    return line
 
 
 def _build_job_group_header(
@@ -396,99 +413,218 @@ def _build_job_group_header(
     gpu_type: Optional[str] = None,
     group_name_width: Optional[int] = None,
     gpu_type_width: Optional[int] = None,
-) -> Table:
-    priority = sum(_job_gpu_count(job) for job in jobs if partition_bucket(job.partition) == "priority")
-    gpu = sum(_job_gpu_count(job) for job in jobs if partition_bucket(job.partition) == "gpu")
-    default = sum(_job_gpu_count(job) for job in jobs if partition_bucket(job.partition) == "default")
+    node_gpu_units: Optional[Mapping[str, str]] = None,
+    node_shards_per_gpu: Optional[Mapping[str, float]] = None,
+) -> Text:
+    shards_per_gpu = (
+        None if node_shards_per_gpu is None else node_shards_per_gpu.get(group_name)
+    )
+    priority = sum(
+        _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
+        for job in jobs
+        if partition_bucket(job.partition) == "priority"
+    )
+    gpu = sum(
+        _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
+        for job in jobs
+        if partition_bucket(job.partition) == "gpu"
+    )
+    default = sum(
+        _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
+        for job in jobs
+        if partition_bucket(job.partition) == "default"
+    )
     used = priority + gpu + default
     total_capacity = None if node_gpu_totals is None else node_gpu_totals.get(group_name)
+    resource_name = (
+        "shard"
+        if node_gpu_units is not None and node_gpu_units.get(group_name) == "shard"
+        else "GPU"
+    )
 
-    table = Table.grid(padding=(0, 2), expand=False)
-    table.add_column(no_wrap=True, width=group_name_width)
-    if gpu_type_width is not None:
-        table.add_column(no_wrap=True, width=gpu_type_width)
-    table.add_column(no_wrap=True)
     summary = Text()
     if total_capacity is not None and total_capacity > 0:
         summary.append(str(used), style="bold yellow")
         summary.append("/", style="dim")
         summary.append(str(total_capacity), style="white")
-        summary.append(f" {_pluralize(total_capacity, 'GPU')} used  ", style="white")
+        summary.append(f" {_pluralize(total_capacity, resource_name)} used  ", style="white")
     else:
         summary.append(str(used), style="bold yellow")
-        summary.append(f" {_pluralize(used, 'GPU')}  ", style="white")
+        summary.append(f" {_pluralize(used, resource_name)}  ", style="white")
     summary.append_text(_build_top_user_bar(priority, gpu, default))
     summary.append("  ")
     summary.append_text(_build_split(priority, gpu, default))
     summary.append("  ")
     summary.append(str(len(jobs)), style="magenta")
     summary.append(f" {_pluralize(len(jobs), 'job')}", style="white")
-    label = Text(group_name, style="bold cyan")
-    gpu_label = Text(gpu_type or "", style="white")
+    line = Text()
+    line.append(group_name, style="bold cyan")
+    if group_name_width and len(group_name) < group_name_width:
+        line.append(" " * (group_name_width - len(group_name)))
     if gpu_type_width is not None:
-        table.add_row(label, gpu_label, summary)
+        line.append("  ")
+        gpu_value = gpu_type or ""
+        line.append(gpu_value, style="white")
+        if len(gpu_value) < gpu_type_width:
+            line.append(" " * (gpu_type_width - len(gpu_value)))
     elif gpu_type:
-        label.append("  ", style="white")
-        label.append(gpu_type, style="white")
-        table.add_row(label, summary)
-    else:
-        table.add_row(label, summary)
-    return table
+        line.append("  ")
+        line.append(gpu_type, style="white")
+    line.append("  ")
+    line.append_text(summary)
+    return line
 
 
-def _append_job_rows(jobs_table: Table, jobs: Sequence[JobRecord]) -> None:
+def _job_column_widths(jobs: Sequence[JobRecord]) -> dict[str, int]:
+    widths = {
+        "job_id": len("ID"),
+        "state": len("State"),
+        "user": len("User"),
+        "partition": len("Partition"),
+        "gpu": len("GPU"),
+        "cpu": len("CPU"),
+        "mem": len("MEM"),
+        "time": len("Time"),
+    }
     for job in jobs:
-        jobs_table.add_row(
-            job.job_id,
-            Text(_job_state_label(job.state), style=_job_state_style(job.state)),
-            Text(job.user, style="cyan"),
-            Text(job.partition, style=_partition_color(job.partition)),
-            _format_job_count(job.gpu) if job.gpu > 0 else ("-" if job.shard <= 0 else _format_job_count(job.shard, suffix="s")),
-            _format_job_count(job.cpu) if job.cpu > 0 else "-",
-            f"{_format_job_count(job.mem)}G" if job.mem > 0 else "-",
-            job.time_limit or "-",
-            job.job_name or "-",
+        widths["job_id"] = max(widths["job_id"], len(job.job_id))
+        widths["state"] = max(widths["state"], len(_job_state_label(job.state)))
+        widths["user"] = max(widths["user"], len(job.user))
+        widths["partition"] = max(widths["partition"], len(job.partition))
+        gpu_value = (
+            _format_job_count(job.gpu)
+            if job.gpu > 0
+            else ("-" if job.shard <= 0 else _format_job_count(job.shard, suffix="s"))
         )
+        widths["gpu"] = max(widths["gpu"], len(gpu_value))
+        widths["cpu"] = max(widths["cpu"], len(_format_job_count(job.cpu) if job.cpu > 0 else "-"))
+        widths["mem"] = max(
+            widths["mem"],
+            len(f"{_format_job_count(job.mem)}G" if job.mem > 0 else "-"),
+        )
+        widths["time"] = max(widths["time"], len(job.time_limit or "-"))
+    return widths
 
 
-def _build_job_rows_table(jobs: Sequence[JobRecord], *, show_header: bool = True) -> Table:
-    jobs_table = Table(
-        box=None,
-        show_header=show_header,
-        show_edge=False,
-        pad_edge=False,
-        collapse_padding=True,
-        padding=(0, 1),
+def _append_job_field(
+    line: Text,
+    value: str,
+    *,
+    width: int,
+    style: str,
+    justify: str = "left",
+) -> None:
+    padding = max(width - len(value), 0)
+    if justify == "right" and padding:
+        line.append(" " * padding)
+    line.append(value, style=style)
+    if justify == "left" and padding:
+        line.append(" " * padding)
+
+
+def _build_job_rows_header(widths: Mapping[str, int]) -> Text:
+    line = Text()
+    _append_job_field(line, "ID", width=widths["job_id"], style="bold white")
+    line.append(" ")
+    _append_job_field(line, "State", width=widths["state"], style="bold white")
+    line.append(" ")
+    _append_job_field(line, "User", width=widths["user"], style="bold white")
+    line.append(" ")
+    _append_job_field(line, "Partition", width=widths["partition"], style="bold white")
+    line.append(" ")
+    _append_job_field(line, "GPU", width=widths["gpu"], style="bold white", justify="right")
+    line.append(" ")
+    _append_job_field(line, "CPU", width=widths["cpu"], style="bold white", justify="right")
+    line.append(" ")
+    _append_job_field(line, "MEM", width=widths["mem"], style="bold white", justify="right")
+    line.append(" ")
+    _append_job_field(line, "Time", width=widths["time"], style="bold white", justify="right")
+    line.append(" ")
+    line.append("Name", style="bold white")
+    return line
+
+
+def _build_job_row_line(job: JobRecord, widths: Mapping[str, int]) -> Text:
+    gpu_value = (
+        _format_job_count(job.gpu)
+        if job.gpu > 0
+        else ("-" if job.shard <= 0 else _format_job_count(job.shard, suffix="s"))
     )
-    jobs_table.add_column("ID", header_style="bold white", no_wrap=True, style="dim")
-    jobs_table.add_column("State", header_style="bold white", no_wrap=True)
-    jobs_table.add_column("User", header_style="bold white", no_wrap=True, style="bright_white")
-    jobs_table.add_column("Partition", header_style="bold white", no_wrap=True)
-    jobs_table.add_column("GPU", header_style="bold white", no_wrap=True, justify="right")
-    jobs_table.add_column("CPU", header_style="bold white", no_wrap=True, justify="right")
-    jobs_table.add_column("MEM", header_style="bold white", no_wrap=True, justify="right")
-    jobs_table.add_column("Time", header_style="bold white", no_wrap=True, justify="right")
-    jobs_table.add_column("Name", header_style="bold white", overflow="fold")
-    _append_job_rows(jobs_table, jobs)
-    return jobs_table
+    cpu_value = _format_job_count(job.cpu) if job.cpu > 0 else "-"
+    mem_value = f"{_format_job_count(job.mem)}G" if job.mem > 0 else "-"
+    time_value = job.time_limit or "-"
+
+    line = Text()
+    _append_job_field(line, job.job_id, width=widths["job_id"], style="dim")
+    line.append(" ")
+    _append_job_field(
+        line,
+        _job_state_label(job.state),
+        width=widths["state"],
+        style=_job_state_style(job.state),
+    )
+    line.append(" ")
+    _append_job_field(line, job.user, width=widths["user"], style="cyan")
+    line.append(" ")
+    _append_job_field(
+        line,
+        job.partition,
+        width=widths["partition"],
+        style=_partition_color(job.partition),
+    )
+    line.append(" ")
+    _append_job_field(line, gpu_value, width=widths["gpu"], style="white", justify="right")
+    line.append(" ")
+    _append_job_field(line, cpu_value, width=widths["cpu"], style="white", justify="right")
+    line.append(" ")
+    _append_job_field(line, mem_value, width=widths["mem"], style="white", justify="right")
+    line.append(" ")
+    _append_job_field(line, time_value, width=widths["time"], style="white", justify="right")
+    line.append(" ")
+    line.append(job.job_name or "-", style="white")
+    return line
+
+
+def _build_job_rows_renderable(
+    jobs: Sequence[JobRecord],
+    widths: Mapping[str, int],
+    *,
+    show_header: bool = True,
+) -> Group:
+    lines: list[Text] = []
+    if show_header:
+        lines.append(_build_job_rows_header(widths))
+    lines.extend(_build_job_row_line(job, widths) for job in jobs)
+    return Group(*lines)
 
 
 def render_jobs_view(
     jobs: Sequence[JobRecord],
     *,
-    title: str = "Jobs",
     node_gpu_totals: Optional[Mapping[str, int]] = None,
     node_gpu_types: Optional[Mapping[str, str]] = None,
+    node_gpu_units: Optional[Mapping[str, str]] = None,
+    node_shards_per_gpu: Optional[Mapping[str, float]] = None,
+    include_overview: bool = True,
+    title: str = "Jobs",
 ) -> Group:
     grouped: Dict[str, List[JobRecord]] = {}
     for job in jobs:
         grouped.setdefault(_job_group_name(job), []).append(job)
 
-    def group_sort_key(item: tuple[str, List[JobRecord]]) -> tuple[int, int, str]:
+    def group_sort_key(item: tuple[str, List[JobRecord]]) -> tuple[int, float, int, str]:
         name, group_jobs = item
         is_pending = 1 if name == "Pending / Unassigned" else 0
-        total_gpu = sum(_job_gpu_count(job) for job in group_jobs)
-        return (is_pending, -total_gpu, name)
+        shards_per_gpu = (
+            None if node_shards_per_gpu is None else node_shards_per_gpu.get(name)
+        )
+        total_gpu = sum(
+            _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
+            for job in group_jobs
+        )
+        total_capacity = None if node_gpu_totals is None else node_gpu_totals.get(name)
+        utilization = (total_gpu / total_capacity) if total_capacity else float(total_gpu)
+        return (is_pending, -utilization, -total_gpu, name)
 
     grouped_items = sorted(grouped.items(), key=group_sort_key)
     group_name_width = max(len(name) for name, _ in grouped_items)
@@ -500,11 +636,14 @@ def render_jobs_view(
             if node_gpu_types is not None
         ]
     )
+    widths = _job_column_widths(jobs)
 
-    renderables: list[Any] = [_build_jobs_overview(jobs, title=title)]
+    renderables: list[Any] = []
+    if include_overview:
+        renderables.append(build_jobs_overview(jobs, title=title))
     pending_jobs: list[JobRecord] = []
-    last_rows_table: Optional[Table] = None
-    for index, (group_name, group_jobs) in enumerate(grouped_items):
+    last_rows_jobs: Optional[list[JobRecord]] = None
+    for group_name, group_jobs in grouped_items:
         sorted_jobs = sorted(
             group_jobs,
             key=lambda job: (
@@ -526,16 +665,19 @@ def render_jobs_view(
                 gpu_type=None if node_gpu_types is None else node_gpu_types.get(group_name),
                 group_name_width=group_name_width,
                 gpu_type_width=gpu_type_width if gpu_type_width > 0 else None,
+                node_gpu_units=node_gpu_units,
+                node_shards_per_gpu=node_shards_per_gpu,
             )
         )
-        last_rows_table = _build_job_rows_table(sorted_jobs)
-        renderables.append(last_rows_table)
+        last_rows_jobs = list(sorted_jobs)
+        renderables.append(_build_job_rows_renderable(last_rows_jobs, widths))
     if pending_jobs:
-        if last_rows_table is None:
+        if last_rows_jobs is None:
             renderables.append(Text(""))
-            renderables.append(_build_job_rows_table(pending_jobs))
+            renderables.append(_build_job_rows_renderable(pending_jobs, widths))
         else:
-            _append_job_rows(last_rows_table, pending_jobs)
+            last_rows_jobs.extend(pending_jobs)
+            renderables[-1] = _build_job_rows_renderable(last_rows_jobs, widths)
     return Group(*renderables)
 
 
@@ -686,11 +828,19 @@ def _availability_style(count: int, total: int, *, show_used: bool = False) -> s
     return "yellow"
 
 
-def _build_counts(count: int, total: int, width: int, *, show_used: bool) -> Text:
+def _build_counts(
+    count: int,
+    total: int,
+    width: int,
+    *,
+    show_used: bool,
+    show_total: bool = True,
+) -> Text:
     counts = Text()
     counts.append(str(count), style=_availability_style(count, total, show_used=show_used))
-    counts.append("/", style="dim")
-    counts.append(str(total), style="white")
+    if show_total:
+        counts.append("/", style="dim")
+        counts.append(str(total), style="white")
     return counts
 
 
@@ -792,13 +942,22 @@ def _resource_cell(
     split_width: int,
     bar_width: int,
     show_used: bool,
+    show_total: bool = True,
 ) -> Text:
     split_text = _build_split(priority, gpu, default)
     split_value = f"{priority}/{gpu}/{default}"
     bar = _build_bar(priority, gpu, default, max(total - priority - gpu - default, 0), bar_width)
     cell = Text()
-    cell.append_text(_build_counts(count, total, counts_width, show_used=show_used))
-    count_value = f"{count}/{total}"
+    cell.append_text(
+        _build_counts(
+            count,
+            total,
+            counts_width,
+            show_used=show_used,
+            show_total=show_total,
+        )
+    )
+    count_value = f"{count}/{total}" if show_total else str(count)
     if len(count_value) < counts_width:
         cell.append(" " * (counts_width - len(count_value)))
     cell.append(" " * CELL_GAP)
@@ -956,8 +1115,9 @@ def _group_header_summary(
         str(count),
         style=f"bold {_availability_style(count, total_count, show_used=show_used)}",
     )
-    summary.append("/")
-    summary.append(str(total_count), style="white")
+    if not show_used:
+        summary.append("/")
+        summary.append(str(total_count), style="white")
     summary.append(
         f" {_pluralize(count, 'shard' if show_shards else 'GPU')} "
         f"{'used' if show_used else 'free'}"
@@ -1018,8 +1178,9 @@ def _cluster_overview_summary(
         str(count),
         style=f"bold {_availability_style(count, total_count, show_used=show_used)}",
     )
-    summary.append("/", style="dim")
-    summary.append(str(total_count), style="white")
+    if not show_used:
+        summary.append("/", style="dim")
+        summary.append(str(total_count), style="white")
     summary.append(
         f" {_pluralize(count, 'shard' if show_shards else 'GPU')} "
         f"{'used' if show_used else 'free'}"
@@ -1211,6 +1372,7 @@ def _build_summary_table(
                 split_width=resource_layout["gpu"]["split_width"],
                 bar_width=resource_layout["gpu"]["bar_width"],
                 show_used=show_used,
+                show_total=not show_used,
             ),
             Text(str(len(grouped_servers)), style="magenta"),
         )

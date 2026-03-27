@@ -13,6 +13,7 @@ from rich.text import Text
 from .accounting import (
     build_cluster_summary,
     build_top_users_summary,
+    process_jobs,
     project_servers_for_users,
 )
 from .collector import (
@@ -38,12 +39,14 @@ from .constants import (
 from .render import (
     _display_gpu_type,
     build_json_payload,
+    build_jobs_overview,
     print_filtered_users,
     render_jobs_view,
     print_summary,
     render_table,
     visible_servers,
 )
+from .models import ClusterState
 from .runner import CommandRunner, SubprocessRunner
 from .slurm import parse_jobs, parse_nodelist, parse_sinfo
 
@@ -144,6 +147,31 @@ def _jobs_sacct_command(
 
 def _jobs_sinfo_command(command: str, *, nodes: Sequence[str]) -> str:
     return _override_command_option(command, ("-n", "--nodes"), ",".join(nodes))
+
+
+def _resolve_servers_for_nodes(
+    runner: CommandRunner,
+    *,
+    sinfo_command: str,
+    nodes: Sequence[str],
+    timeout: int,
+) -> tuple[dict[str, Any], Optional[Any]]:
+    targeted_command = _jobs_sinfo_command(sinfo_command, nodes=nodes)
+    targeted_result = runner.run(targeted_command, timeout)
+    if targeted_result.returncode != 0:
+        return {}, targeted_result
+
+    resolved_servers = parse_sinfo(targeted_result.stdout, gpu_only=False)
+    missing_nodes = [node for node in nodes if node not in resolved_servers]
+    if not missing_nodes:
+        return resolved_servers, None
+
+    full_result = runner.run(sinfo_command, timeout)
+    if full_result.returncode != 0:
+        return {}, full_result
+
+    full_servers = parse_sinfo(full_result.stdout, gpu_only=False)
+    return {name: server for name, server in full_servers.items() if name in nodes}, None
 
 
 def _filtered_jobs(
@@ -364,6 +392,9 @@ def cli_main(
         if not jobs:
             active_console.print(Text("No jobs found matching the criteria.", style="yellow"))
             return EXIT_NO_MATCHES
+        title = "Jobs"
+        if target_user_filter:
+            title = "My Jobs" if len(target_user_filter) == 1 and args.me else "Filtered Jobs"
         job_nodes = sorted(
             {
                 node
@@ -374,10 +405,16 @@ def cli_main(
         )
         node_gpu_totals: dict[str, int] = {}
         node_gpu_types: dict[str, str] = {}
+        node_gpu_units: dict[str, str] = {}
+        node_shards_per_gpu: dict[str, float] = {}
         if job_nodes:
-            sinfo_command = _jobs_sinfo_command(args.sinfo_command, nodes=job_nodes)
-            sinfo_result = active_runner.run(sinfo_command, args.timeout)
-            if sinfo_result.returncode != 0:
+            resolved_servers, sinfo_result = _resolve_servers_for_nodes(
+                active_runner,
+                sinfo_command=args.sinfo_command,
+                nodes=job_nodes,
+                timeout=args.timeout,
+            )
+            if sinfo_result is not None:
                 active_stderr.print(
                     Text(
                         f"sinfo command failed: {sinfo_result.command}",
@@ -387,7 +424,6 @@ def cli_main(
                 if sinfo_result.stderr:
                     active_stderr.print(Text(sinfo_result.stderr.strip(), style="red"))
                 return EXIT_COMMAND_ERROR
-            resolved_servers = parse_sinfo(sinfo_result.stdout, gpu_only=False)
             if args.constraint:
                 jobs = _filter_jobs_by_constraint(
                     jobs,
@@ -408,29 +444,49 @@ def cli_main(
                     name: server for name, server in resolved_servers.items() if name in matching_nodes
                 }
             node_gpu_totals = {
-                name: server.gpu.shards if args.shard and server.gpu.shards > 0 else server.gpu.num
+                name: (
+                    server.gpu.shards
+                    if (args.shard or server.gpu.shards > 0)
+                    and server.gpu.shards > 0
+                    else server.gpu.num
+                )
                 for name, server in resolved_servers.items()
             }
             node_gpu_types = {
                 name: _display_gpu_type(server, show_shards=args.shard)
                 for name, server in resolved_servers.items()
             }
-        title = "Jobs"
-        if target_user_filter:
-            title = "My Jobs" if len(target_user_filter) == 1 and args.me else "Filtered Jobs"
+            node_gpu_units = {
+                name: "shard" if server.gpu.shards > 0 else "GPU"
+                for name, server in resolved_servers.items()
+            }
+            node_shards_per_gpu = {
+                name: (server.gpu.shards / server.gpu.num)
+                for name, server in resolved_servers.items()
+                if server.gpu.shards > 0 and server.gpu.num > 0
+            }
+        active_console.print(build_jobs_overview(jobs, title=title))
         active_console.print(
             render_jobs_view(
                 jobs,
                 title=title,
                 node_gpu_totals=node_gpu_totals,
                 node_gpu_types=node_gpu_types,
+                node_gpu_units=node_gpu_units,
+                node_shards_per_gpu=node_shards_per_gpu,
+                include_overview=False,
             )
         )
         return EXIT_SUCCESS
 
-    if args.top_users is not None and not args.json and not args.shard:
+    if args.top_users is not None and not args.json and not args.shard and not args.constraint:
         active_runner = runner or SubprocessRunner()
-        sacct_result = active_runner.run(args.sacct_command, args.timeout)
+        top_users_sacct_command = _jobs_sacct_command(
+            args.sacct_command,
+            states=("RUNNING",),
+            users=target_user_filter,
+        )
+        sacct_result = active_runner.run(top_users_sacct_command, args.timeout)
         if sacct_result.returncode != 0:
             active_stderr.print(
                 Text(
@@ -441,12 +497,54 @@ def cli_main(
             if sacct_result.stderr:
                 active_stderr.print(Text(sacct_result.stderr.strip(), style="red"))
             return EXIT_COMMAND_ERROR
-        summary = build_top_users_summary(
-            parse_jobs(sacct_result.stdout),
-            target_users=target_user_filter,
-            show_shards=args.shard,
-            top_users_limit=args.top_users,
-        )
+        jobs = parse_jobs(sacct_result.stdout)
+        if any(job.shard > 0 for job in jobs):
+            job_nodes = sorted(
+                {
+                    node
+                    for job in jobs
+                    for node in parse_nodelist(job.nodelist)
+                    if node and node.upper() not in {"N/A", "(NULL)", "NONE"}
+                }
+            )
+            if job_nodes:
+                resolved_servers, sinfo_result = _resolve_servers_for_nodes(
+                    active_runner,
+                    sinfo_command=args.sinfo_command,
+                    nodes=job_nodes,
+                    timeout=args.timeout,
+                )
+                if sinfo_result is not None:
+                    active_stderr.print(
+                        Text(
+                            f"sinfo command failed: {sinfo_result.command}",
+                            style="red",
+                        )
+                    )
+                    if sinfo_result.stderr:
+                        active_stderr.print(Text(sinfo_result.stderr.strip(), style="red"))
+                    return EXIT_COMMAND_ERROR
+                process_jobs(jobs, resolved_servers, store_users=True)
+                summary = build_cluster_summary(
+                    ClusterState(servers=resolved_servers, jobs=jobs),
+                    target_users=target_user_filter,
+                    show_shards=False,
+                    top_users_limit=args.top_users,
+                )
+            else:
+                summary = build_top_users_summary(
+                    jobs,
+                    target_users=target_user_filter,
+                    show_shards=args.shard,
+                    top_users_limit=args.top_users,
+                )
+        else:
+            summary = build_top_users_summary(
+                jobs,
+                target_users=target_user_filter,
+                show_shards=args.shard,
+                top_users_limit=args.top_users,
+            )
         print_summary(
             summary,
             console=active_console,
@@ -472,7 +570,7 @@ def cli_main(
         gpu_only=not args.json,
         constraint=args.constraint,
         debug=args.debug,
-        store_users=bool(args.jobs or target_user_filter or args.json),
+        store_users=bool(args.jobs or target_user_filter or args.json or args.top_users is not None),
     )
 
     try:

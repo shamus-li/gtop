@@ -229,6 +229,31 @@ def test_cli_me_filters_to_current_user():
     assert payload["summary"]["target_users"]["alice"]["default_usage"] == 0
 
 
+def test_cli_me_respects_constraint():
+    sinfo_output, sacct_output = make_small_cluster_outputs()
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            filtered_collect_command("alice"): make_result(filtered_collect_command("alice"), sacct_output),
+        }
+    )
+    stdout = RecordingConsole()
+
+    with patch("gtop.cli.getpass.getuser", return_value="alice"):
+        code = cli_main(
+            ["--json", "--me", "--constraint", "gpu-high"],
+            runner=runner,
+            console=stdout,
+            stderr_console=RecordingConsole(),
+        )
+
+    assert code == EXIT_SUCCESS
+    payload = json.loads(stdout.calls[0][0][0])
+    assert payload["summary"]["gpu_total"] == 4
+    assert [server["name"] for server in payload["servers"]] == ["node-a"]
+    assert payload["summary"]["target_users"]["alice"]["priority_usage"] == 1
+
+
 def test_cli_does_not_print_top_users_by_default():
     sinfo_output, sacct_output = make_small_cluster_outputs()
     runner = FakeRunner(
@@ -700,8 +725,8 @@ def test_cli_filtered_user_view_shows_user_usage_not_cluster_free():
 
     output = stream.getvalue()
     assert code == EXIT_SUCCESS
-    assert "Filtered Usage  1/4 GPU used" in output
-    assert "1/4 GPU used" in output
+    assert "Filtered Usage  1 GPU used" in output
+    assert "1 GPU used" in output
     assert "A100" in output
     assert "node-a" not in output
     assert "1/0/0" in output
@@ -733,8 +758,70 @@ def test_cli_three_way_partition_split_distinguishes_gpu_partition():
 
     output = stream.getvalue()
     assert code == EXIT_SUCCESS
-    assert "1/4 GPU used" in output
+    assert "1 GPU used" in output
     assert "0/1/0" in output
+
+
+def test_cli_filtered_user_summary_counts_shard_usage_as_gpu_occupancy():
+    sinfo_output = (
+        "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|"
+        "gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0"
+    )
+    sacct_output = (
+        "alice|spark|dgx-spark|RUNNING|"
+        "billing=10,cpu=10,gres/shard:nvidia_gb10=40,gres/shard=40,mem=50G,node=1|101|"
+    )
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            filtered_collect_command("alice"): make_result(filtered_collect_command("alice"), sacct_output),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=160, force_terminal=False)
+
+    code = cli_main(
+        ["--users", "alice"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "Filtered Usage  1 GPU used" in output
+    assert "GB10" in output
+    assert "1" in output
+
+
+def test_cli_filtered_user_summary_does_not_double_count_full_gpu_jobs_on_sharded_nodes():
+    sinfo_output = (
+        "shard-node|gpu|gpu:nvidia_a40:2(S:1),shard:nvidia_a40:400(S:1)|"
+        "gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:0(0/200)|0/0/0/0|0|0"
+    )
+    sacct_output = (
+        "alice|gpu|shard-node|RUNNING|"
+        "billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|101|"
+    )
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            filtered_collect_command("alice"): make_result(filtered_collect_command("alice"), sacct_output),
+        }
+    )
+    stdout = RecordingConsole()
+
+    code = cli_main(
+        ["--json", "--users", "alice"],
+        runner=runner,
+        console=stdout,
+        stderr_console=RecordingConsole(),
+    )
+
+    assert code == EXIT_SUCCESS
+    payload = json.loads(stdout.calls[0][0][0])
+    assert payload["summary"]["target_users"]["alice"]["gpu_usage"] == 1
+    assert payload["servers"][0]["usage"]["gpu"]["gpu"] == 1
 
 
 def test_cli_verbose_filtered_user_view_shows_nodes():
@@ -796,8 +883,10 @@ def test_cli_filtered_user_summary_aligns_bars_for_group_totals():
     summary_lines = [line for line in output if "A100" in line or "B200" in line]
     assert code == EXIT_SUCCESS
     assert len(summary_lines) == 2
-    assert "10/12" in summary_lines[0]
-    assert "1/2" in summary_lines[1]
+    assert "10" in summary_lines[0]
+    assert "1" in summary_lines[1]
+    assert "10/12" not in summary_lines[0]
+    assert "1/2" not in summary_lines[1]
     assert summary_lines[0].index("[") == summary_lines[1].index("[")
 
 
@@ -826,6 +915,39 @@ def test_cli_me_verbose_shows_filtered_job_tables():
     assert "101" in output
     assert "alice" in output
     assert "node-b" not in output
+
+
+def test_cli_me_verbose_sharded_job_tables_use_shard_units():
+    sinfo_output = (
+        "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|"
+        "gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0"
+    )
+    sacct_output = (
+        "alice|spark|dgx-spark|RUNNING|"
+        "billing=10,cpu=10,gres/shard:nvidia_gb10=40,gres/shard=40,mem=50G,node=1|101|"
+    )
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            filtered_collect_command("alice"): make_result(filtered_collect_command("alice"), sacct_output),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=180, force_terminal=False)
+
+    code = cli_main(
+        ["--users", "alice", "-v"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "dgx-spark" in output
+    assert "GB10" in output
+    assert "40/80 shards used" in output
+    assert "40s" in output
 
 
 def test_cli_top_users_only_mode_hides_other_sections():
@@ -918,6 +1040,114 @@ def test_cli_top_users_uses_table_with_full_split_header():
     assert " D:" not in output
 
 
+def test_cli_top_users_respects_constraint():
+    sinfo_output, sacct_output = make_small_cluster_outputs()
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            SACCT_COMMAND: make_result(SACCT_COMMAND, sacct_output),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=160, force_terminal=False)
+
+    code = cli_main(
+        ["-U", "--constraint", "gpu-high"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "alice" in output
+    assert "bob" not in output
+    assert runner.calls == [
+        (SINFO_COMMAND, DEFAULT_TIMEOUT),
+        (SACCT_COMMAND, DEFAULT_TIMEOUT),
+    ]
+
+
+def test_cli_top_users_includes_shard_only_usage():
+    sacct_output = (
+        "alice|101|spark_run|RUNNING|spark|dgx-spark|"
+        "billing=10,cpu=10,gres/shard:nvidia_gb10=40,gres/shard=40,mem=50G,node=1|15-00:00:00|"
+    )
+    jobs_sinfo_command = f"{SINFO_COMMAND} -n=dgx-spark"
+    runner = FakeRunner(
+        {
+            SACCT_COMMAND: make_result(SACCT_COMMAND, sacct_output),
+            jobs_sinfo_command: make_result(
+                jobs_sinfo_command,
+                "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0",
+            ),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=160, force_terminal=False)
+
+    code = cli_main(
+        ["-U"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "alice" in output
+    assert "1" in output
+    assert runner.calls == [
+        (SACCT_COMMAND, DEFAULT_TIMEOUT),
+        (jobs_sinfo_command, DEFAULT_TIMEOUT),
+    ]
+
+
+def test_cli_top_users_falls_back_to_full_sinfo_when_targeted_lookup_misses_nodes():
+    sacct_output = "\n".join(
+        [
+            "alice|101|spark_a|RUNNING|spark|dgx-spark|billing=10,cpu=10,gres/shard:nvidia_gb10=40,gres/shard=40,mem=50G,node=1|15-00:00:00|",
+            "alice|102|spark_b|RUNNING|spark-interactive|dgx-spark-02|billing=5,cpu=5,gres/shard:nvidia_gb10=20,gres/shard=20,mem=20G,node=1|2-00:00:00|",
+        ]
+    )
+    jobs_sinfo_command = f"{SINFO_COMMAND} -n=dgx-spark,dgx-spark-02"
+    full_sinfo_output = "\n".join(
+        [
+            "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0",
+            "dgx-spark-02|gpu|gpu:nvidia_gb10:1(S:0-1),shard:nvidia_gb10:80(S:0-1)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:20(20/80)|0/0/0/0|0|0",
+        ]
+    )
+    runner = FakeRunner(
+        {
+            SACCT_COMMAND: make_result(SACCT_COMMAND, sacct_output),
+            jobs_sinfo_command: make_result(
+                jobs_sinfo_command,
+                "dgx-spark-02|gpu|gpu:nvidia_gb10:1(S:0-1),shard:nvidia_gb10:80(S:0-1)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:20(20/80)|0/0/0/0|0|0",
+            ),
+            SINFO_COMMAND: make_result(SINFO_COMMAND, full_sinfo_output),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=180, force_terminal=False)
+
+    code = cli_main(
+        ["-U"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "alice" in output
+    assert "2/0/0" in output
+    assert runner.calls == [
+        (SACCT_COMMAND, DEFAULT_TIMEOUT),
+        (jobs_sinfo_command, DEFAULT_TIMEOUT),
+        (SINFO_COMMAND, DEFAULT_TIMEOUT),
+    ]
+
+
 def test_cli_users_filter_limits_top_users_summary():
     sinfo_output, sacct_output = make_small_cluster_outputs()
     runner = FakeRunner(
@@ -1008,6 +1238,37 @@ def test_cli_jobs_output_includes_job_rows():
     assert "GPU" in output
 
 
+def test_cli_jobs_does_not_print_overview_before_sinfo_succeeds():
+    jobs_command = f"{JOBS_SACCT_COMMAND} --user=alice"
+    jobs_sinfo_command = f"{SINFO_COMMAND} -n=node-a"
+    runner = FakeRunner(
+        {
+            jobs_command: make_result(
+                jobs_command,
+                "alice|101|run_a|RUNNING|gpu|node-a|billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
+            ),
+            jobs_sinfo_command: make_result(
+                jobs_sinfo_command,
+                "",
+                returncode=1,
+                stderr="boom",
+            ),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=140, force_terminal=False)
+
+    code = cli_main(
+        ["--jobs", "--users", "alice"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    assert code == EXIT_COMMAND_ERROR
+    assert "Jobs" not in stream.getvalue()
+
+
 def test_cli_jobs_output_uses_compact_parsed_columns():
     sacct_output = (
         "alice|101|train_run|RUNNING|priority_partition|node-a|"
@@ -1045,6 +1306,74 @@ def test_cli_jobs_output_uses_compact_parsed_columns():
     assert "7-00:00:00" in output
     assert "AllocTRES" not in output
     assert "NodeList" not in output
+
+
+def test_cli_jobs_output_uses_shard_capacity_for_sharded_nodes():
+    sacct_output = (
+        "alice|101|spark_run|RUNNING|spark|dgx-spark|"
+        "billing=10,cpu=10,gres/shard:gb10=40,gres/shard=40,mem=50G,node=1|15-00:00:00|"
+    )
+    jobs_command = JOBS_SACCT_COMMAND
+    jobs_sinfo_command = f"{SINFO_COMMAND} -n=dgx-spark"
+    runner = FakeRunner(
+        {
+            jobs_command: make_result(jobs_command, sacct_output),
+            jobs_sinfo_command: make_result(
+                jobs_sinfo_command,
+                "dgx-spark|gpu|gpu:gb10:1(S:0),shard:gb10:80(S:0)|gpu:gb10:0(IDX:N/A),shard:gb10:40(0/80)|0/0/0/0|0|0",
+            ),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=180, force_terminal=False)
+
+    code = cli_main(
+        ["--jobs"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "dgx-spark" in output
+    assert "GB10" in output
+    assert "40/80 shards used" in output
+    assert "40s" in output
+
+
+def test_cli_jobs_output_converts_full_gpu_jobs_on_sharded_nodes():
+    sacct_output = (
+        "alice|101|full_gpu_run|RUNNING|gpu|shard-node|"
+        "billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|"
+    )
+    jobs_command = JOBS_SACCT_COMMAND
+    jobs_sinfo_command = f"{SINFO_COMMAND} -n=shard-node"
+    runner = FakeRunner(
+        {
+            jobs_command: make_result(jobs_command, sacct_output),
+            jobs_sinfo_command: make_result(
+                jobs_sinfo_command,
+                "shard-node|gpu|gpu:nvidia_a40:2(S:1),shard:nvidia_a40:400(S:1)|gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:0(0/200)|0/0/0/0|0|0",
+            ),
+        }
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, width=180, force_terminal=False)
+
+    code = cli_main(
+        ["--jobs"],
+        runner=runner,
+        console=console,
+        stderr_console=RecordingConsole(),
+    )
+
+    output = stream.getvalue()
+    assert code == EXIT_SUCCESS
+    assert "shard-node" in output
+    assert "A40" in output
+    assert "200/400 shards used" in output
+    assert "full_gpu_run" in output
 
 
 def test_cli_jobs_mode_filters_partition_and_active_states():
@@ -1202,6 +1531,7 @@ def test_cli_jobs_mode_constraint_filters_jobs_by_node_features():
 
     output = stream.getvalue()
     assert code == EXIT_SUCCESS
+    assert "Jobs  1 running" in output
     assert "run_a" in output
     assert "run_b" not in output
 
