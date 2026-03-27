@@ -18,6 +18,7 @@ SINFO_COMMAND = (
     "nodehost:100,features:200,gres:256,gresused:256,cpusstate:100,allocmem:100,memory:100 "
     "-h"
 )
+SINFO_FEATURES_COMMAND = 'sinfo -N -o "%N|%f" -h'
 
 SINFO_FIELD_WIDTHS = [100, 200, 256, 256, 100, 100, 100]
 

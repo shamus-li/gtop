@@ -244,12 +244,72 @@ def _filter_jobs_by_constraint(
     return filtered_jobs
 
 
+def _job_group_name(job: Any) -> str:
+    if job.state.upper().startswith("PEND"):
+        return "Pending / Unassigned"
+    nodelist = job.nodelist.strip()
+    if not nodelist or nodelist.upper() in {"N/A", "(NULL)", "NONE"}:
+        return "Pending / Unassigned"
+    return nodelist
+
+
+def _job_view_node_metadata(
+    jobs: Sequence[Any],
+    resolved_servers: dict[str, Any],
+    *,
+    show_shards: bool,
+) -> tuple[dict[str, int], dict[str, str], dict[str, str], dict[str, float]]:
+    group_nodes: dict[str, set[str]] = {}
+    for job in jobs:
+        group_name = _job_group_name(job)
+        if group_name == "Pending / Unassigned":
+            continue
+        nodes = {
+            node
+            for node in parse_nodelist(job.nodelist)
+            if node and node.upper() not in {"N/A", "(NULL)", "NONE"} and node in resolved_servers
+        }
+        if nodes:
+            group_nodes.setdefault(group_name, set()).update(nodes)
+
+    node_gpu_totals: dict[str, int] = {}
+    node_gpu_types: dict[str, str] = {}
+    node_gpu_units: dict[str, str] = {}
+    node_shards_per_gpu: dict[str, float] = {}
+    for group_name, grouped_nodes in group_nodes.items():
+        group_servers = [resolved_servers[name] for name in sorted(grouped_nodes)]
+        all_sharded = all(server.gpu.shards > 0 for server in group_servers)
+        unit = "shard" if all_sharded else "GPU"
+        node_gpu_totals[group_name] = sum(
+            server.gpu.shards if all_sharded else server.gpu.num
+            for server in group_servers
+        )
+        if all_sharded:
+            node_gpu_units[group_name] = unit
+
+        gpu_types = {
+            _display_gpu_type(server, show_shards=show_shards)
+            for server in group_servers
+        }
+        node_gpu_types[group_name] = next(iter(gpu_types)) if len(gpu_types) == 1 else "Mixed"
+
+        if all_sharded:
+            shards_per_gpu = {
+                server.gpu.shards / server.gpu.num
+                for server in group_servers
+                if server.gpu.num > 0
+            }
+            if len(shards_per_gpu) == 1:
+                node_shards_per_gpu[group_name] = next(iter(shards_per_gpu))
+    return node_gpu_totals, node_gpu_types, node_gpu_units, node_shards_per_gpu
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Display SLURM cluster usage with detailed node and resource information",
         epilog=(
             "Legend:\n"
-            "  magenta = priority   cyan = gpu   blue = default   dim = free\n"
+            "  orchid = priority   teal = gpu   cornflower = default   dim = free\n"
             "  counts are free/total, then priority/gpu/default"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -443,28 +503,16 @@ def cli_main(
                 resolved_servers = {
                     name: server for name, server in resolved_servers.items() if name in matching_nodes
                 }
-            node_gpu_totals = {
-                name: (
-                    server.gpu.shards
-                    if (args.shard or server.gpu.shards > 0)
-                    and server.gpu.shards > 0
-                    else server.gpu.num
-                )
-                for name, server in resolved_servers.items()
-            }
-            node_gpu_types = {
-                name: _display_gpu_type(server, show_shards=args.shard)
-                for name, server in resolved_servers.items()
-            }
-            node_gpu_units = {
-                name: "shard" if server.gpu.shards > 0 else "GPU"
-                for name, server in resolved_servers.items()
-            }
-            node_shards_per_gpu = {
-                name: (server.gpu.shards / server.gpu.num)
-                for name, server in resolved_servers.items()
-                if server.gpu.shards > 0 and server.gpu.num > 0
-            }
+            (
+                node_gpu_totals,
+                node_gpu_types,
+                node_gpu_units,
+                node_shards_per_gpu,
+            ) = _job_view_node_metadata(
+                jobs,
+                resolved_servers,
+                show_shards=args.shard,
+            )
         active_console.print(build_jobs_overview(jobs, title=title))
         active_console.print(
             render_jobs_view(
@@ -559,7 +607,7 @@ def cli_main(
         sacct_command=(
             _jobs_sacct_command(
                 args.sacct_command,
-                states=("RUNNING",),
+                states=JOBS_DEFAULT_STATES if (args.verbose and target_user_filter) else ("RUNNING",),
                 users=target_user_filter,
             )
             if target_user_filter
@@ -618,6 +666,24 @@ def cli_main(
         if target_user_filter
         else servers
     )
+    filtered_verbose_jobs = []
+    if args.verbose and target_user_filter and not args.jobs:
+        filtered_verbose_jobs = _filtered_jobs(
+            state.jobs,
+            target_users=target_user_filter,
+            partition_filter=None,
+            states=JOBS_DEFAULT_STATES,
+        )
+        filtered_verbose_jobs = [
+            job for job in filtered_verbose_jobs if job.gpu > 0 or job.shard > 0
+        ]
+        if args.constraint:
+            filtered_verbose_jobs = _filter_jobs_by_constraint(
+                filtered_verbose_jobs,
+                state.servers,
+                constraint=args.constraint,
+                stderr_console=active_stderr,
+            )
 
     if args.json:
         payload = build_json_payload(
@@ -645,17 +711,47 @@ def cli_main(
             summary,
             console=active_console,
         )
-    active_console.print(
-        render_table(
-            display_servers,
-            show_jobs=args.jobs or (args.verbose and bool(target_user_filter)),
-            show_shards=args.shard,
-            width=getattr(active_console, "width", None),
-            show_used=bool(target_user_filter),
-            overview_title="Filtered Usage" if target_user_filter else "Cluster Overview",
-            verbose=args.verbose or args.jobs,
+
+    if display_servers:
+        active_console.print(
+            render_table(
+                display_servers,
+                show_jobs=args.jobs,
+                show_shards=args.shard,
+                width=getattr(active_console, "width", None),
+                show_used=bool(target_user_filter),
+                overview_title="Filtered Usage" if target_user_filter else "Cluster Overview",
+                verbose=args.verbose or args.jobs,
+            )
         )
-    )
+    if filtered_verbose_jobs:
+        (
+            node_gpu_totals,
+            node_gpu_types,
+            node_gpu_units,
+            node_shards_per_gpu,
+        ) = _job_view_node_metadata(
+            filtered_verbose_jobs,
+            state.servers,
+            show_shards=args.shard,
+        )
+        title = (
+            "My Jobs"
+            if target_user_filter is not None and len(target_user_filter) == 1 and args.me
+            else "Filtered Jobs"
+        )
+        if display_servers:
+            active_console.print()
+        active_console.print(
+            render_jobs_view(
+                filtered_verbose_jobs,
+                title=title,
+                node_gpu_totals=node_gpu_totals,
+                node_gpu_types=node_gpu_types,
+                node_gpu_units=node_gpu_units,
+                node_shards_per_gpu=node_shards_per_gpu,
+            )
+        )
     return EXIT_SUCCESS
 
 

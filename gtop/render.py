@@ -20,7 +20,6 @@ GROUP_HEADER_WIDTHS = {
 }
 BAR_WIDTHS = {"gpu": 8, "cpu": 12, "mem": 10}
 CELL_GAP = 1
-COLUMN_GAP = 1
 GROUP_GAP = 2
 
 GPU_CAPABILITY_PATTERNS = (
@@ -52,6 +51,13 @@ GPU_CAPABILITY_PATTERNS = (
     ("B200", 24),
 )
 TOP_USER_BAR_WIDTH = 12
+# OKLCH(0.72 0.19 320)
+PRIORITY_PARTITION_COLOR = "#c764f4"
+# OKLCH(0.80 0.13 165)
+GPU_PARTITION_COLOR = "#4fd3a1"
+# OKLCH(0.78 0.09 255)
+DEFAULT_PARTITION_COLOR = "#88b4ff"
+NODE_COUNT_COLOR = "white"
 
 
 @lru_cache(maxsize=None)
@@ -75,10 +81,10 @@ def _top_user_label(user: str) -> str:
 def _partition_color(partition: str) -> str:
     bucket = partition_bucket(partition)
     if bucket == "priority":
-        return "magenta"
+        return PRIORITY_PARTITION_COLOR
     if bucket == "gpu":
-        return "cyan"
-    return "blue"
+        return GPU_PARTITION_COLOR
+    return DEFAULT_PARTITION_COLOR
 
 
 def _pluralize(count: int, singular: str) -> str:
@@ -269,7 +275,7 @@ def print_filtered_users(
         line.append("  ")
         line.append(str(total_usage), style="bold yellow")
         line.append(f" {_pluralize(total_usage, summary.resource_label)} across ")
-        line.append(str(node_count), style="bold magenta")
+        line.append(str(node_count), style=f"bold {NODE_COUNT_COLOR}")
         line.append(f" {_pluralize(node_count, 'node')}")
         for partition, count in sorted(stats.usage_by_partition.items()):
             line.append("  ")
@@ -400,7 +406,7 @@ def build_jobs_overview(jobs: Sequence[JobRecord], *, title: str) -> Text:
         line.append(" pending", style="white")
     if requeued:
         line.append("  ")
-        line.append(str(requeued), style="magenta")
+        line.append(str(requeued), style="white")
         line.append(" requeued", style="white")
     return line
 
@@ -455,7 +461,7 @@ def _build_job_group_header(
     summary.append("  ")
     summary.append_text(_build_split(priority, gpu, default))
     summary.append("  ")
-    summary.append(str(len(jobs)), style="magenta")
+    summary.append(str(len(jobs)), style="white")
     summary.append(f" {_pluralize(len(jobs), 'job')}", style="white")
     line = Text()
     line.append(group_name, style="bold cyan")
@@ -791,11 +797,11 @@ def _build_bar(priority: int, gpu: int, default: int, free: int, width: int) -> 
     )
     bar = Text("[", style="dim")
     if priority_len:
-        bar.append("█" * priority_len, style="magenta")
+        bar.append("█" * priority_len, style=PRIORITY_PARTITION_COLOR)
     if gpu_len:
-        bar.append("█" * gpu_len, style="cyan")
+        bar.append("█" * gpu_len, style=GPU_PARTITION_COLOR)
     if default_len:
-        bar.append("█" * default_len, style="blue")
+        bar.append("█" * default_len, style=DEFAULT_PARTITION_COLOR)
     if free_len:
         bar.append("·" * free_len, style="dim")
     bar.append("]", style="dim")
@@ -804,11 +810,24 @@ def _build_bar(priority: int, gpu: int, default: int, free: int, width: int) -> 
 
 def _build_split(priority: int, gpu: int, default: int) -> Text:
     split = Text()
-    split.append(str(priority), style="dim magenta" if priority == 0 else "magenta")
+    split.append(
+        str(priority),
+        style=f"dim {PRIORITY_PARTITION_COLOR}"
+        if priority == 0
+        else PRIORITY_PARTITION_COLOR,
+    )
     split.append("/", style="dim")
-    split.append(str(gpu), style="dim cyan" if gpu == 0 else "cyan")
+    split.append(
+        str(gpu),
+        style=f"dim {GPU_PARTITION_COLOR}" if gpu == 0 else GPU_PARTITION_COLOR,
+    )
     split.append("/", style="dim")
-    split.append(str(default), style="dim blue" if default == 0 else "blue")
+    split.append(
+        str(default),
+        style=f"dim {DEFAULT_PARTITION_COLOR}"
+        if default == 0
+        else DEFAULT_PARTITION_COLOR,
+    )
     return split
 
 
@@ -859,8 +878,8 @@ def _build_top_users_table(summary: ClusterSummary) -> Table:
         padding=(0, 1),
     )
     table.add_column("User", header_style="bold white", no_wrap=True)
-    table.add_column("Nodes", header_style="bold white", justify="right", no_wrap=True)
     table.add_column(resource_header, header_style="bold white", justify="right", no_wrap=True)
+    table.add_column("Nodes", header_style="bold white", justify="right", no_wrap=True)
     table.add_column("", header_style="bold white", no_wrap=True)
     table.add_column(
         "",
@@ -870,8 +889,8 @@ def _build_top_users_table(summary: ClusterSummary) -> Table:
     for stats in summary.top_users:
         table.add_row(
             Text(_top_user_label(stats.user), style="cyan"),
-            Text(str(len(stats.nodes)), style="magenta"),
             Text(str(stats.total_usage()), style="bold yellow"),
+            Text(str(len(stats.nodes)), style=NODE_COUNT_COLOR),
             _build_top_user_bar(
                 stats.priority_usage,
                 stats.gpu_usage,
@@ -1374,7 +1393,7 @@ def _build_summary_table(
                 show_used=show_used,
                 show_total=not show_used,
             ),
-            Text(str(len(grouped_servers)), style="magenta"),
+            Text(str(len(grouped_servers)), style=NODE_COUNT_COLOR),
         )
     return table
 

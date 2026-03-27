@@ -72,6 +72,6 @@ gtop --help
 Legend:
 
 ```text
-magenta = priority   cyan = gpu   blue = default   dim = free
+orchid = priority   teal = gpu   cornflower = default   dim = free
 counts are free/total, then priority/gpu/default
 ```
