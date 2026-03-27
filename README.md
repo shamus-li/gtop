@@ -1,66 +1,111 @@
 # gtop
-Display stats about GPU usage on a SLURM cluster. Designed specifically for Cornell University's G2 and Unicorn clusters.
 
-## Installation
+`gtop` shows live SLURM GPU usage on Cornell-style clusters, with a fast GPU-type summary by default and deeper job or node views when you need them.
 
-```
-git clone git@github.com:shamus-li/gtop.git
-cd gtop
-pip install .
-```
+## Install
 
-If you did the above instructions in a virtual environment, you can create a symlink from the gtop executable to a directory in your PATH. While the environment is still active, use the which command to find the exact location of the installed script.
-```
-which gtop
-mkdir -p ~/.local/bin
-echo "export PATH="$HOME/.local/bin:$PATH" >> ~/.bashrc
-source ~/.bashrc
-ln -s GTOP_PATH ~/.local/bin/gtop   # replace GTOP_PATH with the output of `which gtop`
+```bash
+uv tool install git+ssh://git@github.com/shamus-li/gtop.git
 ```
 
-## Usage
-(P/D/I) refers to compute resources that are used by a priority partition user, used by a default partition user, and idle resources.
+If `gtop` is not found after install, add uv's tool bin directory to your shell `PATH`:
 
-```
-gtop                    # display stats about all nodes in the cluster
-gtop --gpu              # display stats only about nodes with gpus
-gtop --disp-users       # include information which which specific jobs are using which resources
-gtop --users USER       # filter the results for specific user accounts
-gtop --constraint=GPU   # filter nodes whose features satisfy the constraint expression (e.g., gpu-high)
-gtop --sort name        # switch back to alphabetical sorting (default groups by feature)
-gtop --shard            # display sharded GPU information instead of total GPU count
-gtop --mig-info         # display detailed MIG (Multi-Instance GPU) information
-gtop --no-parallel      # disable parallel command execution (for debugging)
-gtop --debug            # enable debug output for troubleshooting usage calculation issues
+```bash
+uv tool update-shell
+exec "$SHELL" -l
 ```
 
-## New Features
+The installed executable is placed in `$(uv tool dir --bin)` (typically `~/.local/bin`).
 
-### Sharded GPU Support
-The tool supports SLURM's sharded GPU functionality, allowing multiple jobs to share GPU resources:
-- **Default behavior**: Shows the total number of physical GPUs available (e.g., `2 x nvidia_h100_nvl`)
-- **With `--shard` flag**: Displays shard counts and detailed sharding information
-  - Shows shard utilization as `priority/default/idle` based on shard count
-  - Displays GPU type being sharded (e.g., `48 x nvidia_h100_nvl (Sharded)`)
+Upgrade or remove:
 
-### MIG (Multi-Instance GPU) Support
-Enhanced support for NVIDIA MIG partitioned GPUs:
-- Automatically detects MIG instances (e.g., `1g.5gb`, `2g.10gb`, `3g.20gb`, etc.)
-- Displays MIG information in GPU type column as `MIG(instance_types)`
-- Use `--mig-info` flag to see detailed MIG instance breakdown per server
-- Shows MIG usage as `used/idle (MIG)` format
+```bash
+uv tool upgrade gtop
+uv tool uninstall gtop
+```
 
-## Troubleshooting
+## Default View
 
-### Usage Shows All Zeros
-If you see all nodes showing 0 usage when you know there are running jobs, try these steps:
+```bash
+gtop
+```
 
-1. **Enable debug mode**: `gtop --debug` to see detailed job processing information
-2. **Check job filtering**: The tool only shows RUNNING jobs - verify jobs are in RUNNING state
-3. **Verify node names match**: Debug output will show if job nodes aren't found in the server list
-4. **Use sequential mode**: `gtop --no-parallel --debug` for easier troubleshooting
+Plain `gtop` shows one row per GPU type. It is the high-level view: how many GPUs are free, how usage is split across `priority`, `gpu`, and `default` partitions, and how many nodes are in each GPU family.
 
-### Common Issues
-- **Permission errors**: Ensure you have access to `sinfo` and `sacct` commands
-- **Timeout errors**: Some clusters may need longer timeouts for large job lists
-- **Node name mismatches**: Job node names must exactly match `sinfo` node names
+Legend from `gtop --help`:
+
+```text
+magenta = priority   cyan = gpu   blue = default   dim = free
+counts are free/total, then priority/gpu/default
+```
+
+## Common Commands
+
+```bash
+gtop -v
+```
+
+Show the node-by-node breakdown instead of the GPU-type summary.
+
+```bash
+gtop --me
+gtop -u wl757
+```
+
+Filter the view to one or more users. This becomes a usage view rather than a free-capacity view.
+
+```bash
+gtop --me -v
+```
+
+Show the filtered node breakdown and the jobs you are running on each node.
+
+```bash
+gtop -U
+gtop -U 10
+```
+
+Show only the largest cluster users. The default is the top 25 users.
+
+```bash
+gtop --jobs
+gtop --jobs --me
+gtop --jobs --partition monakhova
+```
+
+Show the active jobs view. Jobs are grouped by node, with parsed `GPU`, `CPU`, and `MEM` columns instead of raw `AllocTRES`.
+
+```bash
+gtop --constraint gpu-high
+gtop --sort name
+```
+
+Filter nodes by SLURM constraint expression or change the sort order.
+
+```bash
+gtop -s
+```
+
+Switch the display from whole GPUs to shard counts on sharded nodes.
+
+```bash
+gtop --json
+```
+
+Emit JSON instead of the Rich terminal view.
+
+## Jobs View
+
+`gtop --jobs` is meant to replace the common `sacct | grep ... | sort` workflow for active jobs.
+
+- It defaults to `RUNNING,PENDING,REQUEUED`.
+- `--partition` matches both the SLURM partition name and the node name, so `gtop --jobs --partition monakhova` also catches jobs running on `monakhova-*` nodes from other partitions.
+- Job rows show parsed resources and time limits, while the node header shows used GPUs and the GPU type for that node when available.
+
+## Help And Debugging
+
+```bash
+gtop --help
+```
+
+Low-level flags such as `--timeout`, `--sinfo-command`, `--sacct-command`, `--debug`, and `--no-parallel` are grouped under `Debug options` in the help output.

@@ -8,7 +8,6 @@ This directory contains comprehensive tests for the gtop GPU parsing functionali
 Unit tests for core GPU parsing functions:
 - Regular GPU parsing (non-sharded)
 - Sharded GPU detection and parsing
-- MIG support
 - Job TRES allocation parsing
 - Edge cases and error handling
 
@@ -27,7 +26,6 @@ Test runner that executes all tests using pytest and provides detailed results.
 Real output from `sinfo -O nodehost:100,gres:100,gresused:100,cpusstate:100,allocmem:100,memory:100 -h` command showing various GPU configurations including:
 - Regular GPUs
 - Sharded GPUs (with and without separate shard entries)
-- MIG instances
 - Mixed GPU types
 - CPU-only nodes
 
@@ -58,7 +56,6 @@ The tests validate:
 1. **GPU Type Detection**:
    - ✅ Regular GPUs are not marked as sharded
    - ✅ True sharded GPUs are properly identified
-   - ✅ MIG instances are handled correctly
    - ✅ Mixed GPU types are supported
 
 2. **Sharding Logic**:

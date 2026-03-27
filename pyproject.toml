@@ -10,7 +10,7 @@ authors = [
 ]
 description = "A tool to display SLURM cluster usage with detailed node and resource information."
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License", # Choose a license
@@ -25,6 +25,15 @@ dependencies = [
 test = [
     "pytest",
     "pytest-cov",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "ty>=0.0.2",
+    "vulture",
 ]
 
 [project.scripts]

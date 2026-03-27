@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from typing import Any, cast
 
 
 def _install_rich_stub() -> None:
@@ -14,10 +15,10 @@ def _install_rich_stub() -> None:
     if importlib.util.find_spec("rich") is not None:
         return
 
-    rich_module = types.ModuleType("rich")
+    rich_module = cast(Any, types.ModuleType("rich"))
 
     # Minimal box namespace with the attributes gtop expects
-    box_module = types.ModuleType("rich.box")
+    box_module = cast(Any, types.ModuleType("rich.box"))
     box_module.ROUNDED = "ROUNDED"
     box_module.SIMPLE = "SIMPLE"
     rich_module.box = box_module
@@ -30,7 +31,7 @@ def _install_rich_stub() -> None:
             # Tests do not rely on console output, so swallow anything printed.
             return None
 
-    console_module = types.ModuleType("rich.console")
+    console_module = cast(Any, types.ModuleType("rich.console"))
     console_module.Console = _DummyConsole
     rich_module.console = console_module
 
@@ -45,14 +46,23 @@ def _install_rich_stub() -> None:
         def add_row(self, *args, **kwargs):
             self.rows.append(args)
 
-    table_module = types.ModuleType("rich.table")
+    table_module = cast(Any, types.ModuleType("rich.table"))
     table_module.Table = _DummyTable
     rich_module.table = table_module
+
+    text_module = cast(Any, types.ModuleType("rich.text"))
+
+    class _DummyText(str):
+        def __new__(cls, value="", *args, **kwargs):
+            return str.__new__(cls, value)
+
+    text_module.Text = _DummyText
 
     sys.modules["rich"] = rich_module
     sys.modules["rich.box"] = box_module
     sys.modules["rich.console"] = console_module
     sys.modules["rich.table"] = table_module
+    sys.modules["rich.text"] = text_module
 
 
 _install_rich_stub()
