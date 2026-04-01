@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Set
 
 from rich.text import Text
 
-from .constants import JOB_RESOURCE_NAMES, PARTITIONS
+from .constants import JOB_RESOURCE_NAMES
 from .models import (
     ClusterState,
     ClusterSummary,
@@ -19,22 +19,9 @@ from .models import (
     TopUserSummary,
     UserSummary,
 )
+from .partitions import partition_bucket
 from .resources import parse_usage
 from .slurm import parse_jobs, parse_nodelist
-
-
-def partition_bucket(name: str) -> str:
-    lower_name = name.lower()
-    if "default" in lower_name:
-        return "default"
-    if "gpu" in lower_name:
-        return "gpu"
-    return "priority"
-
-
-def is_priority(name: str) -> bool:
-    return partition_bucket(name) == "priority"
-
 
 def shard_equivalent(server: ServerState, gpu_count: float) -> float:
     if gpu_count <= 0 or server.gpu.shards <= 0 or server.gpu.num <= 0:
@@ -75,7 +62,6 @@ def process_jobs(
                 )
             continue
 
-        partition_type = partition_bucket(job.partition)
         matched_nodes = [node for node in nodes if node in servers]
 
         if debug_enabled and stderr_console is not None:
@@ -122,7 +108,7 @@ def process_jobs(
                 )
             for resource in JOB_RESOURCE_NAMES:
                 amount = shard_amount if resource == "shard" else per_node[resource]
-                servers[node].usage[resource].add(partition_type, amount)
+                servers[node].usage[resource].add(job.partition, amount)
         processed_jobs += 1
 
     if debug_enabled and stderr_console is not None:
@@ -167,9 +153,8 @@ def build_top_users_summary(
             user_summary.priority_usage += resource_count
         elif bucket == "gpu":
             user_summary.gpu_usage += resource_count
-        else:
+        elif bucket == "default":
             user_summary.default_usage += resource_count
-
     target_user_summaries = {
         user: all_user_summaries.get(user, UserSummary())
         for user in (target_users or set())
@@ -181,8 +166,7 @@ def build_top_users_summary(
         users_for_ranking,
         key=lambda item: (
             -item[1].total_usage(),
-            -item[1].priority_usage,
-            -item[1].gpu_usage,
+            -max(item[1].usage_by_partition.values(), default=0),
             item[0],
         ),
     )[:top_users_limit]
@@ -197,6 +181,7 @@ def build_top_users_summary(
             TopUserSummary(
                 user=user,
                 nodes=set(stats.nodes),
+                usage_by_partition=dict(stats.usage_by_partition),
                 priority_usage=stats.priority_usage,
                 gpu_usage=stats.gpu_usage,
                 default_usage=stats.default_usage,
@@ -258,9 +243,8 @@ def build_cluster_summary(
                 user_summary.priority_usage += resource_count
             elif bucket == "gpu":
                 user_summary.gpu_usage += resource_count
-            else:
+            elif bucket == "default":
                 user_summary.default_usage += resource_count
-
     target_user_summaries = {
         user: all_user_summaries.get(user, UserSummary())
         for user in (target_users or set())
@@ -272,8 +256,7 @@ def build_cluster_summary(
         users_for_ranking,
         key=lambda item: (
             -item[1].total_usage(),
-            -item[1].priority_usage,
-            -item[1].gpu_usage,
+            -max(item[1].usage_by_partition.values(), default=0),
             item[0],
         ),
     )[:top_users_limit]
@@ -288,6 +271,7 @@ def build_cluster_summary(
             TopUserSummary(
                 user=user,
                 nodes=set(stats.nodes),
+                usage_by_partition=dict(stats.usage_by_partition),
                 priority_usage=stats.priority_usage,
                 gpu_usage=stats.gpu_usage,
                 default_usage=stats.default_usage,
@@ -308,28 +292,29 @@ def project_servers_for_users(
         projected_usage = {
             resource: ResourceUsageSplit() for resource in JOB_RESOURCE_NAMES
         }
-        gpu_usage_by_partition = {partition: 0.0 for partition in PARTITIONS}
-        explicit_shard_usage_by_partition = {partition: 0.0 for partition in PARTITIONS}
-        shard_usage_by_partition = {partition: 0.0 for partition in PARTITIONS}
+        gpu_usage_by_partition: dict[str, float] = {}
+        explicit_shard_usage_by_partition: dict[str, float] = {}
         for job_id, job in server.users.items():
             if job.netid not in target_users:
                 continue
             projected_users[job_id] = job
-            partition_type = partition_bucket(job.partition)
-            projected_usage["cpu"].add(partition_type, job.cpu)
-            projected_usage["mem"].add(partition_type, job.mem)
-            projected_usage["shard"].add(partition_type, job.shard)
-            gpu_usage_by_partition[partition_type] += job.gpu
-            shard_usage_by_partition[partition_type] += job.shard
+            projected_usage["cpu"].add(job.partition, job.cpu)
+            projected_usage["mem"].add(job.partition, job.mem)
+            projected_usage["shard"].add(job.partition, job.shard)
+            gpu_usage_by_partition[job.partition] = (
+                gpu_usage_by_partition.get(job.partition, 0.0) + job.gpu
+            )
             if job.gpu <= 0 and job.shard > 0:
-                explicit_shard_usage_by_partition[partition_type] += job.shard
-        for partition_type in PARTITIONS:
+                explicit_shard_usage_by_partition[job.partition] = (
+                    explicit_shard_usage_by_partition.get(job.partition, 0.0) + job.shard
+                )
+        for partition_name, gpu_usage in gpu_usage_by_partition.items():
             projected_usage["gpu"].add(
-                partition_type,
-                gpu_usage_by_partition[partition_type]
+                partition_name,
+                gpu_usage
                 + gpu_occupancy_equivalent(
                     server,
-                    explicit_shard_usage_by_partition[partition_type],
+                    explicit_shard_usage_by_partition.get(partition_name, 0.0),
                 ),
             )
         projected_servers.append(

@@ -9,8 +9,8 @@ from rich.console import Console, Group
 from rich.table import Table
 from rich.text import Text
 
-from .accounting import partition_bucket
 from .models import ClusterSummary, JobRecord, ResourceUsageSplit, ServerState, to_jsonable
+from .partitions import SEMANTIC_PARTITIONS, partition_bucket, uses_semantic_partitions
 
 GROUP_HEADER_WIDTHS = {
     "node": 20,
@@ -57,6 +57,15 @@ PRIORITY_PARTITION_COLOR = "#c764f4"
 GPU_PARTITION_COLOR = "#4fd3a1"
 # OKLCH(0.78 0.09 255)
 DEFAULT_PARTITION_COLOR = "#88b4ff"
+GENERIC_PARTITION_COLORS = (
+    "#ff9f43",
+    "#5fcefa",
+    "#7dd87d",
+    "#f78fb3",
+    "#f6e58d",
+    "#c7ecee",
+)
+OTHER_PARTITION_COLOR = "#a4b0be"
 NODE_COUNT_COLOR = "white"
 
 
@@ -84,7 +93,75 @@ def _partition_color(partition: str) -> str:
         return PRIORITY_PARTITION_COLOR
     if bucket == "gpu":
         return GPU_PARTITION_COLOR
-    return DEFAULT_PARTITION_COLOR
+    if bucket == "default":
+        return DEFAULT_PARTITION_COLOR
+    if partition == "other":
+        return OTHER_PARTITION_COLOR
+    color_index = sum((index + 1) * ord(char) for index, char in enumerate(partition.lower()))
+    return GENERIC_PARTITION_COLORS[color_index % len(GENERIC_PARTITION_COLORS)]
+
+
+def _usage_partitions(usage_info: ResourceUsageSplit) -> dict[str, float]:
+    return {
+        partition: amount
+        for partition, amount in usage_info.items()
+        if amount > 0
+    }
+
+
+def _summary_partitions(summary: Any) -> dict[str, float]:
+    if summary.usage_by_partition:
+        return {partition: float(amount) for partition, amount in summary.usage_by_partition.items()}
+    return {
+        partition: amount
+        for partition, amount in (
+            ("priority", float(summary.priority_usage)),
+            ("gpu", float(summary.gpu_usage)),
+            ("default", float(summary.default_usage)),
+        )
+        if amount > 0
+    }
+
+
+def _semantic_partition_totals(partition_amounts: Mapping[str, int | float]) -> dict[str, int]:
+    totals = {partition: 0 for partition in SEMANTIC_PARTITIONS}
+    for partition, amount in partition_amounts.items():
+        bucket = partition_bucket(partition)
+        if bucket is None:
+            continue
+        totals[bucket] += int(round(amount))
+    return totals
+
+
+def _partition_segments(
+    partition_amounts: dict[str, float],
+) -> tuple[list[tuple[str, int, str]], bool]:
+    normalized = {
+        partition: int(round(amount))
+        for partition, amount in partition_amounts.items()
+        if int(round(amount)) > 0
+    }
+    if not normalized:
+        return [], True
+    if uses_semantic_partitions(normalized):
+        totals = _semantic_partition_totals(normalized)
+        return [
+            (partition, totals[partition], _partition_color(partition))
+            for partition in SEMANTIC_PARTITIONS
+        ], True
+
+    ordered = sorted(
+        normalized.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    segments = [
+        (partition, count, _partition_color(partition))
+        for partition, count in ordered[:3]
+    ]
+    other_total = sum(count for _, count in ordered[3:])
+    if other_total > 0:
+        segments.append(("other", other_total, _partition_color("other")))
+    return segments, False
 
 
 def _pluralize(count: int, singular: str) -> str:
@@ -109,7 +186,7 @@ def _resource_totals(
         usage = server.usage["gpu"]
         total = float(server.gpu.num)
 
-    used = float(usage.priority) + float(usage.gpu) + float(usage.default)
+    used = float(usage.total())
     return used, total
 
 
@@ -123,9 +200,17 @@ def _resource_split(
 
 def format_resource(server: ServerState, res: str, show_shards: bool = False) -> str:
     usage_info = _resource_split(server, res, show_shards)
-    priority = usage_info.priority
-    gpu = usage_info.gpu
-    default = usage_info.default
+    partition_amounts = _usage_partitions(usage_info)
+    segments, semantic_mode = _partition_segments(partition_amounts)
+    if semantic_mode:
+        totals = _semantic_partition_totals(partition_amounts)
+        priority = totals["priority"]
+        gpu = totals["gpu"]
+        default = totals["default"]
+    else:
+        priority = sum(count for _, count, _ in segments)
+        gpu = 0
+        default = 0
 
     if res == "cpu":
         idle = server.cpu.idle
@@ -425,22 +510,13 @@ def _build_job_group_header(
     shards_per_gpu = (
         None if node_shards_per_gpu is None else node_shards_per_gpu.get(group_name)
     )
-    priority = sum(
-        _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
-        for job in jobs
-        if partition_bucket(job.partition) == "priority"
-    )
-    gpu = sum(
-        _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
-        for job in jobs
-        if partition_bucket(job.partition) == "gpu"
-    )
-    default = sum(
-        _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
-        for job in jobs
-        if partition_bucket(job.partition) == "default"
-    )
-    used = priority + gpu + default
+    partition_amounts: dict[str, float] = {}
+    for job in jobs:
+        partition_amounts[job.partition] = (
+            partition_amounts.get(job.partition, 0.0)
+            + _job_group_resource_count(job, shards_per_gpu=shards_per_gpu)
+        )
+    used = sum(int(round(amount)) for amount in partition_amounts.values())
     total_capacity = None if node_gpu_totals is None else node_gpu_totals.get(group_name)
     resource_name = (
         "shard"
@@ -457,9 +533,9 @@ def _build_job_group_header(
     else:
         summary.append(str(used), style="bold yellow")
         summary.append(f" {_pluralize(used, resource_name)}  ", style="white")
-    summary.append_text(_build_top_user_bar(priority, gpu, default))
+    summary.append_text(_build_top_user_bar(partition_amounts))
     summary.append("  ")
-    summary.append_text(_build_split(priority, gpu, default))
+    summary.append_text(_build_split(partition_amounts))
     summary.append("  ")
     summary.append(str(len(jobs)), style="white")
     summary.append(f" {_pluralize(len(jobs), 'job')}", style="white")
@@ -737,97 +813,114 @@ def _resource_numbers(
     *,
     show_shards: bool,
     show_used: bool = False,
-) -> Tuple[int, int, int, int, int]:
+) -> tuple[int, int, dict[str, float]]:
     usage = _resource_split(server, resource, show_shards)
-    priority = int(round(usage.priority))
-    gpu = int(round(usage.gpu))
-    default = int(round(usage.default))
-    used = priority + gpu + default
+    partition_amounts = _usage_partitions(usage)
+    used = sum(int(round(amount)) for amount in partition_amounts.values())
     if resource == "gpu":
         total = server.gpu.shards if show_shards and server.gpu.shards > 0 else server.gpu.num
         count = used if show_used else max(int(total) - used, 0)
-        return count, int(total), priority, gpu, default
+        return count, int(total), partition_amounts
     if resource == "cpu":
         total = used + server.cpu.idle
         count = used if show_used else server.cpu.idle
-        return count, total, priority, gpu, default
+        return count, total, partition_amounts
 
     total = int(round(server.mem.total / 1024.0))
     free = int(round(server.mem.idle / 1024.0))
     count = used if show_used else free
-    return count, total, priority, gpu, default
+    return count, total, partition_amounts
 
 
 def _split_segments(
-    priority: int, gpu: int, default: int, free: int, width: int
-) -> tuple[int, int, int, int]:
-    total = priority + gpu + default + free
+    values: Sequence[int],
+    width: int,
+) -> list[int]:
+    total = sum(values)
     if width <= 0:
-        return 0, 0, 0, 0
+        return [0 for _ in values]
     if total <= 0:
-        return 0, 0, 0, width
+        result = [0 for _ in values]
+        result[-1] = width
+        return result
 
-    raw = [
-        priority / total * width,
-        gpu / total * width,
-        default / total * width,
-        free / total * width,
-    ]
+    raw = [value / total * width for value in values]
     base = [math.floor(value) for value in raw]
     remainder = width - sum(base)
     order = sorted(
-        range(4),
+        range(len(values)),
         key=lambda index: (raw[index] - base[index], raw[index]),
         reverse=True,
     )
     for index in order:
         if remainder <= 0:
             break
-        if [priority, gpu, default, free][index] > 0:
+        if values[index] > 0:
             base[index] += 1
             remainder -= 1
     if remainder > 0:
-        base[3] += remainder
-    return base[0], base[1], base[2], base[3]
+        base[-1] += remainder
+    return base
 
 
-def _build_bar(priority: int, gpu: int, default: int, free: int, width: int) -> Text:
-    priority_len, gpu_len, default_len, free_len = _split_segments(
-        priority, gpu, default, free, width
+def _build_bar(
+    partition_amounts: dict[str, float],
+    *,
+    free: int,
+    width: int,
+) -> Text:
+    segments, _ = _partition_segments(partition_amounts)
+    lengths = _split_segments(
+        [count for _, count, _ in segments] + [free],
+        width,
     )
     bar = Text("[", style="dim")
-    if priority_len:
-        bar.append("█" * priority_len, style=PRIORITY_PARTITION_COLOR)
-    if gpu_len:
-        bar.append("█" * gpu_len, style=GPU_PARTITION_COLOR)
-    if default_len:
-        bar.append("█" * default_len, style=DEFAULT_PARTITION_COLOR)
+    for (_, _, color), segment_length in zip(segments, lengths[:-1]):
+        if segment_length:
+            bar.append("█" * segment_length, style=color)
+    free_len = lengths[-1]
     if free_len:
         bar.append("·" * free_len, style="dim")
     bar.append("]", style="dim")
     return bar
 
 
-def _build_split(priority: int, gpu: int, default: int) -> Text:
+def _build_split(
+    partition_amounts: dict[str, float],
+    *,
+    max_items: int = 2,
+) -> Text:
+    segments, semantic_mode = _partition_segments(partition_amounts)
     split = Text()
-    split.append(
-        str(priority),
-        style=f"dim {PRIORITY_PARTITION_COLOR}"
-        if priority == 0
-        else PRIORITY_PARTITION_COLOR,
-    )
-    split.append("/", style="dim")
-    split.append(
-        str(gpu),
-        style=f"dim {GPU_PARTITION_COLOR}" if gpu == 0 else GPU_PARTITION_COLOR,
-    )
-    split.append("/", style="dim")
-    split.append(
-        str(default),
-        style=f"dim {DEFAULT_PARTITION_COLOR}"
-        if default == 0
-        else DEFAULT_PARTITION_COLOR,
-    )
+    if semantic_mode:
+        by_name = {name: count for name, count, _ in segments}
+        for index, partition in enumerate(SEMANTIC_PARTITIONS):
+            count = by_name.get(partition, 0)
+            if index:
+                split.append("/", style="dim")
+            split.append(
+                str(count),
+                style=f"dim {_partition_color(partition)}"
+                if count == 0
+                else _partition_color(partition),
+            )
+        return split
+
+    if not segments:
+        split.append("-", style="dim")
+        return split
+
+    visible_segments = segments[:max_items]
+    remaining_total = sum(count for _, count, _ in segments[max_items:])
+    for index, (partition, count, color) in enumerate(visible_segments):
+        if index:
+            split.append(" ", style="dim")
+        split.append(f"{partition}:", style="white")
+        split.append(str(count), style=color)
+    if remaining_total:
+        if visible_segments:
+            split.append(" ", style="dim")
+        split.append(f"+{remaining_total}", style=OTHER_PARTITION_COLOR)
     return split
 
 
@@ -863,8 +956,8 @@ def _build_counts(
     return counts
 
 
-def _build_top_user_bar(priority: int, gpu: int, default: int) -> Text:
-    return _build_bar(priority, gpu, default, 0, TOP_USER_BAR_WIDTH)
+def _build_top_user_bar(partition_amounts: dict[str, float]) -> Text:
+    return _build_bar(partition_amounts, free=0, width=TOP_USER_BAR_WIDTH)
 
 
 def _build_top_users_table(summary: ClusterSummary) -> Table:
@@ -887,20 +980,13 @@ def _build_top_users_table(summary: ClusterSummary) -> Table:
         no_wrap=True,
     )
     for stats in summary.top_users:
+        partition_amounts = _summary_partitions(stats)
         table.add_row(
             Text(_top_user_label(stats.user), style="cyan"),
             Text(str(stats.total_usage()), style="bold yellow"),
             Text(str(len(stats.nodes)), style=NODE_COUNT_COLOR),
-            _build_top_user_bar(
-                stats.priority_usage,
-                stats.gpu_usage,
-                stats.default_usage,
-            ),
-            _build_split(
-                stats.priority_usage,
-                stats.gpu_usage,
-                stats.default_usage,
-            ),
+            _build_top_user_bar(partition_amounts),
+            _build_split(partition_amounts),
         )
     return table
 
@@ -917,21 +1003,21 @@ def _resource_layout(
         counts_width = 0
         split_width = 0
         for server in servers:
-            count, total, priority, gpu, default = _resource_numbers(
+            count, total, partition_amounts = _resource_numbers(
                 server, resource, show_shards=show_shards, show_used=show_used
             )
             counts_width = max(counts_width, len(f"{count}/{total}"))
-            split_width = max(split_width, len(f"{priority}/{gpu}/{default}"))
+            split_width = max(split_width, len(_build_split(partition_amounts).plain))
         if grouped_servers_list:
             for _, grouped_servers in grouped_servers_list:
-                count, total, priority, gpu, default = _group_resource_numbers(
+                count, total, partition_amounts = _group_resource_numbers(
                     grouped_servers,
                     resource,
                     show_shards=show_shards,
                     show_used=show_used,
                 )
                 counts_width = max(counts_width, len(f"{count}/{total}"))
-                split_width = max(split_width, len(f"{priority}/{gpu}/{default}"))
+                split_width = max(split_width, len(_build_split(partition_amounts).plain))
         bar_width = BAR_WIDTHS[resource]
         column_width = (
             counts_width
@@ -953,9 +1039,7 @@ def _resource_layout(
 def _resource_cell(
     count: int,
     total: int,
-    priority: int,
-    gpu: int,
-    default: int,
+    partition_amounts: dict[str, float],
     *,
     counts_width: int,
     split_width: int,
@@ -963,9 +1047,14 @@ def _resource_cell(
     show_used: bool,
     show_total: bool = True,
 ) -> Text:
-    split_text = _build_split(priority, gpu, default)
-    split_value = f"{priority}/{gpu}/{default}"
-    bar = _build_bar(priority, gpu, default, max(total - priority - gpu - default, 0), bar_width)
+    split_text = _build_split(partition_amounts)
+    split_value = split_text.plain
+    used = sum(int(round(amount)) for amount in partition_amounts.values())
+    bar = _build_bar(
+        partition_amounts,
+        free=max(total - used, 0),
+        width=bar_width,
+    )
     cell = Text()
     cell.append_text(
         _build_counts(
@@ -998,15 +1087,13 @@ def _resource_cell_for_server(
     show_shards: bool,
     show_used: bool,
 ) -> Text:
-    count, total, priority, gpu, default = _resource_numbers(
+    count, total, partition_amounts = _resource_numbers(
         server, resource, show_shards=show_shards, show_used=show_used
     )
     return _resource_cell(
         count,
         total,
-        priority,
-        gpu,
-        default,
+        partition_amounts,
         counts_width=counts_width,
         split_width=split_width,
         bar_width=bar_width,
@@ -1077,7 +1164,7 @@ def _group_servers(
         grouped.setdefault(_display_gpu_type(server, show_shards=show_shards), []).append(server)
 
     def gpu_free(server: ServerState) -> int:
-        count, _, _, _, _ = _resource_numbers(
+        count, _, _ = _resource_numbers(
             server,
             "gpu",
             show_shards=show_shards,
@@ -1313,14 +1400,12 @@ def _group_resource_numbers(
     *,
     show_shards: bool,
     show_used: bool,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, dict[str, float]]:
     count = 0
     total = 0
-    priority = 0
-    gpu = 0
-    default = 0
+    partition_amounts: dict[str, float] = {}
     for server in grouped_servers:
-        server_count, server_total, server_priority, server_gpu, server_default = _resource_numbers(
+        server_count, server_total, server_partition_amounts = _resource_numbers(
             server,
             resource,
             show_shards=show_shards,
@@ -1328,10 +1413,9 @@ def _group_resource_numbers(
         )
         count += server_count
         total += server_total
-        priority += server_priority
-        gpu += server_gpu
-        default += server_default
-    return count, total, priority, gpu, default
+        for partition, amount in server_partition_amounts.items():
+            partition_amounts[partition] = partition_amounts.get(partition, 0.0) + amount
+    return count, total, partition_amounts
 
 
 def _build_summary_table(
@@ -1373,7 +1457,7 @@ def _build_summary_table(
         overflow="ignore",
     )
     for gpu_type, grouped_servers in grouped_servers_list:
-        gpu_count, gpu_total, gpu_priority, gpu_gpu, gpu_default = _group_resource_numbers(
+        gpu_count, gpu_total, gpu_partition_amounts = _group_resource_numbers(
             grouped_servers,
             "gpu",
             show_shards=show_shards,
@@ -1384,9 +1468,7 @@ def _build_summary_table(
             _resource_cell(
                 gpu_count,
                 gpu_total,
-                gpu_priority,
-                gpu_gpu,
-                gpu_default,
+                gpu_partition_amounts,
                 counts_width=resource_layout["gpu"]["counts_width"],
                 split_width=resource_layout["gpu"]["split_width"],
                 bar_width=resource_layout["gpu"]["bar_width"],

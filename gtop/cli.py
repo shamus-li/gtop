@@ -23,6 +23,10 @@ from .collector import (
     NoMatchingServersError,
     collect_cluster_state,
 )
+from .command_options import (
+    override_command_option,
+    remove_command_options,
+)
 from .constraints import matches_constraint
 from .constants import (
     DEFAULT_TIMEOUT,
@@ -74,57 +78,6 @@ def _job_states_arg(value: str) -> tuple[str, ...]:
         raise argparse.ArgumentTypeError("job states must not be empty")
     return states
 
-
-def _override_command_option(command: str, option_names: Sequence[str], value: str) -> str:
-    existing = _command_option_value(command, option_names)
-    if existing == value:
-        return command
-    tokens = shlex.split(command)
-    filtered: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in option_names:
-            skip_next = True
-            continue
-        if any(token.startswith(f"{name}=") for name in option_names):
-            continue
-        filtered.append(token)
-    filtered.append(f"{option_names[0]}={value}")
-    return shlex.join(filtered)
-
-
-def _remove_command_options(command: str, option_names: Sequence[str]) -> str:
-    tokens = shlex.split(command)
-    filtered: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in option_names:
-            skip_next = True
-            continue
-        if any(token.startswith(f"{name}=") for name in option_names):
-            continue
-        filtered.append(token)
-    return shlex.join(filtered)
-
-
-def _command_option_value(command: str, option_names: Sequence[str]) -> Optional[str]:
-    tokens = shlex.split(command)
-    for index, token in enumerate(tokens):
-        if token in option_names and index + 1 < len(tokens):
-            return tokens[index + 1]
-        for name in option_names:
-            prefix = f"{name}="
-            if token.startswith(prefix):
-                return token[len(prefix) :]
-    return None
-
-
 def _jobs_sacct_command(
     command: str,
     *,
@@ -135,18 +88,118 @@ def _jobs_sacct_command(
 ) -> str:
     updated = command
     if apply_states:
-        updated = _override_command_option(updated, ("--state",), ",".join(states))
+        updated = override_command_option(updated, ("--state",), ",".join(states))
     else:
-        updated = _remove_command_options(updated, ("--state",))
+        updated = remove_command_options(updated, ("--state",))
     if users:
-        updated = _override_command_option(updated, ("--user", "--users"), ",".join(sorted(users)))
+        updated = override_command_option(updated, ("--user", "--users"), ",".join(sorted(users)))
     if partition:
-        updated = _override_command_option(updated, ("--partition", "--partitions"), partition)
+        updated = override_command_option(updated, ("--partition", "--partitions"), partition)
     return updated
 
 
 def _jobs_sinfo_command(command: str, *, nodes: Sequence[str]) -> str:
-    return _override_command_option(command, ("-n", "--nodes"), ",".join(nodes))
+    return override_command_option(command, ("-n", "--nodes"), ",".join(nodes))
+
+
+def _user_partition_assoc_command(user: str) -> str:
+    return (
+        "sacctmgr show assoc "
+        f"where user={shlex.quote(user)} "
+        "format=Account,Partition -Pn"
+    )
+
+
+def _known_partitions_command() -> str:
+    return 'sinfo -h -o "%P"'
+
+
+def _normalize_partition_name(value: str) -> str:
+    return value.strip().rstrip("*")
+
+
+def _known_partition_names(output: str) -> set[str]:
+    return {
+        normalized
+        for normalized in (
+            _normalize_partition_name(line)
+            for line in output.splitlines()
+        )
+        if normalized
+    }
+
+
+def _detect_user_partitions(
+    assoc_output: str,
+    *,
+    known_partitions: set[str],
+) -> tuple[str, ...]:
+    detected: set[str] = set()
+    for raw_line in assoc_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        account, _, partition = line.partition("|")
+        normalized_partition = _normalize_partition_name(partition)
+        if normalized_partition:
+            detected.add(normalized_partition)
+            continue
+        normalized_account = _normalize_partition_name(account)
+        if normalized_account and normalized_account in known_partitions:
+            detected.add(normalized_account)
+    return tuple(sorted(detected))
+
+
+def _partition_scope_label(partitions: Sequence[str]) -> str:
+    return ", ".join(partitions)
+
+
+def _print_partition_scope(
+    console: Any,
+    *,
+    partitions: Sequence[str],
+    source: str,
+) -> None:
+    mode = "auto-detected" if source == "auto" else "explicit"
+    console.print(
+        Text(f"Partition scope ({mode}): {_partition_scope_label(partitions)}", style="dim")
+    )
+
+
+def _overview_title(
+    *,
+    target_users: Optional[Set[str]],
+    partition_filter: Optional[Sequence[str]],
+) -> str:
+    if partition_filter:
+        prefix = "Partition" if len(partition_filter) == 1 else "Partitions"
+        label = _partition_scope_label(partition_filter)
+        if target_users:
+            return f"Filtered Usage ({prefix.lower()} {label})"
+        return f"{prefix} {label}"
+    return "Filtered Usage" if target_users else "Cluster Overview"
+
+
+def _filter_jobs_to_servers(
+    jobs: Sequence[Any],
+    *,
+    server_names: Set[str],
+) -> list[Any]:
+    return [
+        job
+        for job in jobs
+        if any(node in server_names for node in parse_nodelist(job.nodelist))
+    ]
+
+
+def _matches_partition_scope(value: str, partition: str) -> bool:
+    candidate = value.strip().lower()
+    needle = partition.strip().lower()
+    if not candidate or not needle:
+        return False
+    return candidate == needle or candidate.startswith(f"{needle}-") or candidate.startswith(
+        f"{needle}_"
+    )
 
 
 def _resolve_servers_for_nodes(
@@ -183,20 +236,18 @@ def _filtered_jobs(
 ) -> list[Any]:
     state_set = {state.upper() for state in states}
     filtered = []
-    partition_needles = (
-        {partition.lower() for partition in partition_filter}
-        if partition_filter
-        else None
-    )
+    partition_needles = tuple(partition_filter) if partition_filter else None
     for job in jobs:
         if target_users and job.user not in target_users:
             continue
         if partition_needles:
-            haystacks = (job.partition.lower(), job.nodelist.lower())
             if not any(
-                needle in haystack
+                _matches_partition_scope(job.partition, needle)
+                or any(
+                    _matches_partition_scope(node, needle)
+                    for node in parse_nodelist(job.nodelist)
+                )
                 for needle in partition_needles
-                for haystack in haystacks
             ):
                 continue
         if job.state.upper() not in state_set:
@@ -309,8 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Display SLURM cluster usage with detailed node and resource information",
         epilog=(
             "Legend:\n"
-            "  orchid = priority   teal = gpu   cornflower = default   dim = free\n"
-            "  counts are free/total, then priority/gpu/default"
+            "  colored segments reflect detected partition groups or partitions   dim = free\n"
+            "  Cornell-style priority/gpu/default buckets are preserved when present"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -350,7 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
         "-p",
         "--partition",
         nargs="+",
-        help="Filter jobs by partition in --jobs mode",
+        help="Scope results to one or more partitions",
+    )
+    core.add_argument(
+        "--mine",
+        action="store_true",
+        help="Auto-detect your accessible partitions and scope results to them",
     )
     core.add_argument(
         "--states",
@@ -413,16 +469,55 @@ def cli_main(
         parser.error("--timeout must be a positive integer")
     if args.top_users is not None and args.top_users < 0:
         parser.error("--top-users must be zero or greater")
+    if args.partition and args.mine:
+        parser.error("--partition and --mine cannot be combined")
 
     active_console = console or Console()
     active_stderr = stderr_console or Console(stderr=True)
+    active_runner = runner or SubprocessRunner()
     target_users: Set[str] = set(args.users) if args.users else set()
+    current_user = getpass.getuser() if (args.me or args.mine) else None
     if args.me:
-        target_users.add(getpass.getuser())
+        assert current_user is not None
+        target_users.add(current_user)
     target_user_filter: Optional[Set[str]] = target_users or None
+    partition_filter = tuple(args.partition) if args.partition else None
+    partition_scope_source = "explicit" if partition_filter else None
+    if args.mine:
+        assert current_user is not None
+        assoc_command = _user_partition_assoc_command(current_user)
+        assoc_result = active_runner.run(assoc_command, args.timeout)
+        if assoc_result.returncode != 0:
+            active_stderr.print(
+                Text(
+                    f"sacctmgr command failed: {assoc_result.command}",
+                    style="red",
+                )
+            )
+            if assoc_result.stderr:
+                active_stderr.print(Text(assoc_result.stderr.strip(), style="red"))
+            return EXIT_COMMAND_ERROR
+        known_partitions_result = active_runner.run(_known_partitions_command(), args.timeout)
+        if known_partitions_result.returncode != 0:
+            active_stderr.print(
+                Text(
+                    f"sinfo command failed: {known_partitions_result.command}",
+                    style="red",
+                )
+            )
+            if known_partitions_result.stderr:
+                active_stderr.print(Text(known_partitions_result.stderr.strip(), style="red"))
+            return EXIT_COMMAND_ERROR
+        partition_filter = _detect_user_partitions(
+            assoc_result.stdout,
+            known_partitions=_known_partition_names(known_partitions_result.stdout),
+        )
+        if not partition_filter:
+            active_console.print(Text("No accessible partitions detected.", style="yellow"))
+            return EXIT_NO_MATCHES
+        partition_scope_source = "auto"
 
     if args.jobs and not args.json:
-        active_runner = runner or SubprocessRunner()
         jobs_base_command = (
             JOBS_SACCT_COMMAND if args.sacct_command == SACCT_COMMAND else args.sacct_command
         )
@@ -446,7 +541,7 @@ def cli_main(
         jobs = _filtered_jobs(
             parse_jobs(sacct_result.stdout),
             target_users=target_user_filter,
-            partition_filter=args.partition,
+            partition_filter=partition_filter,
             states=args.states,
         )
         if not jobs:
@@ -513,6 +608,12 @@ def cli_main(
                 resolved_servers,
                 show_shards=args.shard,
             )
+        if partition_filter:
+            _print_partition_scope(
+                active_console,
+                partitions=partition_filter,
+                source=partition_scope_source or "explicit",
+            )
         active_console.print(build_jobs_overview(jobs, title=title))
         active_console.print(
             render_jobs_view(
@@ -527,8 +628,13 @@ def cli_main(
         )
         return EXIT_SUCCESS
 
-    if args.top_users is not None and not args.json and not args.shard and not args.constraint:
-        active_runner = runner or SubprocessRunner()
+    if (
+        args.top_users is not None
+        and not args.json
+        and not args.shard
+        and not args.constraint
+        and partition_filter is None
+    ):
         top_users_sacct_command = _jobs_sacct_command(
             args.sacct_command,
             states=("RUNNING",),
@@ -616,6 +722,7 @@ def cli_main(
         timeout=args.timeout,
         parallel=not args.no_parallel,
         gpu_only=not args.json,
+        partition_filter=partition_filter,
         constraint=args.constraint,
         debug=args.debug,
         store_users=bool(args.jobs or target_user_filter or args.json or args.top_users is not None),
@@ -671,12 +778,17 @@ def cli_main(
         filtered_verbose_jobs = _filtered_jobs(
             state.jobs,
             target_users=target_user_filter,
-            partition_filter=None,
+            partition_filter=partition_filter if partition_filter else None,
             states=JOBS_DEFAULT_STATES,
         )
         filtered_verbose_jobs = [
             job for job in filtered_verbose_jobs if job.gpu > 0 or job.shard > 0
         ]
+        if partition_filter:
+            filtered_verbose_jobs = _filter_jobs_to_servers(
+                filtered_verbose_jobs,
+                server_names=set(state.servers),
+            )
         if args.constraint:
             filtered_verbose_jobs = _filter_jobs_by_constraint(
                 filtered_verbose_jobs,
@@ -695,6 +807,13 @@ def cli_main(
         )
         _write_json_output(json.dumps(payload, indent=2, sort_keys=True), console)
         return EXIT_SUCCESS
+
+    if partition_filter:
+        _print_partition_scope(
+            active_console,
+            partitions=partition_filter,
+            source=partition_scope_source or "explicit",
+        )
 
     if args.top_users is not None:
         print_summary(
@@ -720,7 +839,10 @@ def cli_main(
                 show_shards=args.shard,
                 width=getattr(active_console, "width", None),
                 show_used=bool(target_user_filter),
-                overview_title="Filtered Usage" if target_user_filter else "Cluster Overview",
+                overview_title=_overview_title(
+                    target_users=target_user_filter,
+                    partition_filter=partition_filter,
+                ),
                 verbose=args.verbose or args.jobs,
             )
         )

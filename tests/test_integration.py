@@ -177,9 +177,9 @@ def test_process_jobs_applies_gpu_usage_split():
     process_jobs(gtop_output, servers)
 
     badfellow = servers["badfellow"].usage["gpu"]
-    assert badfellow.priority == 2.0
     assert badfellow.gpu == 1.0
     assert badfellow.default == 2.0
+    assert badfellow.partitions["cuvl"] == 2.0
 
     # CPU nodes should keep zero GPU usage even after processing
     assert servers["g2-cpu-29"].usage["gpu"].default == 0

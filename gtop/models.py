@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Dict, List, Set
 
 from .constants import JOB_RESOURCE_NAMES
+from .partitions import partition_bucket
 
 
 @dataclass
@@ -31,12 +32,27 @@ class ResourceUsageSplit:
     priority: float = 0.0
     gpu: float = 0.0
     default: float = 0.0
+    partitions: Dict[str, float] = field(default_factory=dict)
 
     def total(self) -> float:
+        if self.partitions:
+            return sum(self.partitions.values())
         return self.priority + self.gpu + self.default
 
-    def add(self, partition_type: str, amount: float) -> None:
-        setattr(self, partition_type, getattr(self, partition_type) + amount)
+    def add(self, partition_name: str, amount: float) -> None:
+        self.partitions[partition_name] = self.partitions.get(partition_name, 0.0) + amount
+        bucket = partition_bucket(partition_name)
+        if bucket is not None:
+            setattr(self, bucket, getattr(self, bucket) + amount)
+
+    def items(self):
+        if self.partitions:
+            return self.partitions.items()
+        return {
+            "priority": self.priority,
+            "gpu": self.gpu,
+            "default": self.default,
+        }.items()
 
 
 @dataclass
@@ -106,6 +122,8 @@ class UserSummary:
     default_usage: int = 0
 
     def total_usage(self) -> int:
+        if self.usage_by_partition:
+            return sum(self.usage_by_partition.values())
         return self.priority_usage + self.gpu_usage + self.default_usage
 
 
@@ -113,11 +131,14 @@ class UserSummary:
 class TopUserSummary:
     user: str
     nodes: Set[str] = field(default_factory=set)
+    usage_by_partition: Dict[str, int] = field(default_factory=dict)
     priority_usage: int = 0
     gpu_usage: int = 0
     default_usage: int = 0
 
     def total_usage(self) -> int:
+        if self.usage_by_partition:
+            return sum(self.usage_by_partition.values())
         return self.priority_usage + self.gpu_usage + self.default_usage
 
 

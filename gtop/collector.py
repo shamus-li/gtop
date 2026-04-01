@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import shlex
 from typing import Any, Optional
 
 from rich.text import Text
 
 from .accounting import process_jobs
+from .command_options import override_command_option
 from .constraints import matches_constraint
 from .constants import DEFAULT_TIMEOUT, SACCT_COMMAND, SINFO_COMMAND, SINFO_FEATURES_COMMAND
 from .models import ClusterState
@@ -21,6 +21,7 @@ class CollectionOptions:
     timeout: int = DEFAULT_TIMEOUT
     parallel: bool = True
     gpu_only: bool = False
+    partition_filter: Optional[tuple[str, ...]] = None
     constraint: Optional[str] = None
     debug: bool = False
     store_users: bool = True
@@ -44,27 +45,16 @@ class ClusterParseError(GTopError):
 class NoMatchingServersError(GTopError):
     pass
 
-
-def _override_command_option(command: str, option_names: tuple[str, ...], value: str) -> str:
-    tokens = shlex.split(command)
-    filtered: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in option_names:
-            skip_next = True
-            continue
-        if any(token.startswith(f"{name}=") for name in option_names):
-            continue
-        filtered.append(token)
-    filtered.append(f"{option_names[0]}={value}")
-    return shlex.join(filtered)
-
-
 def _sinfo_command_for_nodes(command: str, nodes: list[str]) -> str:
-    return _override_command_option(command, ("-n", "--nodes"), ",".join(nodes))
+    return override_command_option(command, ("-n", "--nodes"), ",".join(nodes))
+
+
+def _sinfo_command_for_partitions(command: str, partitions: tuple[str, ...]) -> str:
+    return override_command_option(
+        command,
+        ("-p", "--partition", "--partitions"),
+        ",".join(partitions),
+    )
 
 
 def _constraint_matching_nodes(
@@ -97,6 +87,16 @@ def collect_cluster_state(
 ) -> ClusterState:
     active_options = options or CollectionOptions()
     constraint = active_options.constraint.strip() if active_options.constraint else None
+    scoped_sinfo_command = (
+        _sinfo_command_for_partitions(active_options.sinfo_command, active_options.partition_filter)
+        if active_options.partition_filter
+        else active_options.sinfo_command
+    )
+    scoped_sinfo_features_command = (
+        _sinfo_command_for_partitions(SINFO_FEATURES_COMMAND, active_options.partition_filter)
+        if active_options.partition_filter
+        else SINFO_FEATURES_COMMAND
+    )
     constraint_fast_path = (
         constraint is not None
         and active_options.sinfo_command == SINFO_COMMAND
@@ -105,7 +105,7 @@ def collect_cluster_state(
     if constraint_fast_path:
         assert constraint is not None
         feature_results = run_commands(
-            {"sinfo_features": SINFO_FEATURES_COMMAND},
+            {"sinfo_features": scoped_sinfo_features_command},
             timeout=active_options.timeout,
             runner=runner,
             parallel=False,
@@ -124,7 +124,7 @@ def collect_cluster_state(
             )
         results = run_commands(
             {
-                "sinfo": _sinfo_command_for_nodes(active_options.sinfo_command, matching_nodes),
+                "sinfo": _sinfo_command_for_nodes(scoped_sinfo_command, matching_nodes),
                 "sacct": active_options.sacct_command,
             },
             timeout=active_options.timeout,
@@ -133,7 +133,7 @@ def collect_cluster_state(
         )
     else:
         results = run_commands(
-            {"sinfo": active_options.sinfo_command, "sacct": active_options.sacct_command},
+            {"sinfo": scoped_sinfo_command, "sacct": active_options.sacct_command},
             timeout=active_options.timeout,
             runner=runner,
             parallel=active_options.parallel,
