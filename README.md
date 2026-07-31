@@ -1,17 +1,16 @@
 # gtop
 
-`gtop` shows live SLURM GPU usage with node and partition detail. It preserves the Cornell-style priority/gpu/default view when those partitions exist, and otherwise adapts to the cluster's actual partition names.
+`gtop` shows live SLURM GPU usage with node, user, job, and partition detail.
+
+## Prerequisites
+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+- A login node where `sinfo` and `sacct` can read the cluster state
 
 ## Install
 
 ```bash
-uv tool install git+ssh://git@github.com/shamus-li/gtop.git
-```
-
-For a local checkout:
-
-```bash
-uv tool install --force --editable .
+uv tool install git+https://github.com/shamus-li/gtop.git
 ```
 
 If `gtop` is not on `PATH`, let `uv` add its tool bin directory and restart your shell:
@@ -29,48 +28,49 @@ The binary is installed in `$(uv tool dir --bin)` (usually `~/.local/bin`).
 gtop
 ```
 
-Default output is a GPU-family summary: free GPUs, partition split, and node count.
+The default view groups free capacity by GPU family. `--nodes` expands those
+groups into nodes, `--jobs` shows active jobs, and `-U` shows the top 25 users.
 
 ```bash
 gtop -v
+gtop --nodes
 ```
 
 Show the node-by-node view.
 
 ```bash
-gtop --me
+gtop -m
 gtop -u wl757
-gtop --me -v
-gtop --partition cornell
-gtop --mine
+gtop -u wl757 abc123
+gtop -m -v
 ```
 
-Filter to one or more users, scope the view to specific partitions, or auto-detect your accessible partitions. Filtered views show usage rather than free capacity. `-v` also includes per-node jobs.
+Filter to your own usage or one or more users. Use `-j -m` to see your jobs.
 
 ```bash
 gtop -U
-gtop -U 10
 ```
 
-Show only the top users. Default is 25.
+Show the top 25 users.
 
 ```bash
-gtop --jobs
-gtop --jobs --me
-gtop --jobs -p monakhova
-gtop --jobs --mine
+gtop -j
+gtop -j -m
+gtop -j -p monakhova
 ```
 
-Show active jobs grouped by node with parsed `GPU`, `CPU`, `MEM`, and time columns.
+Jobs always include running, pending, and requeued records.
 
 ```bash
-gtop --constraint gpu-high
-gtop --sort name
+gtop -p monakhova gpu
+gtop -C gpu gpu-high
 gtop -s
 gtop --json
 ```
 
-Use `--constraint` everywhere, switch to shard counts with `-s`, or emit JSON with `--json`.
+`-p` accepts one or more partitions. `-C` requires every listed node feature.
+`-s` switches capacity and top-user views to shard counts. `--json` emits a
+compact, view-specific schema.
 
 ## Help
 
@@ -78,9 +78,4 @@ Use `--constraint` everywhere, switch to shard counts with `-s`, or emit JSON wi
 gtop --help
 ```
 
-Legend:
-
-```text
-orchid = priority   teal = gpu   cornflower = default   dim = free
-counts are free/total, then priority/gpu/default
-```
+The help includes every option and the display legend.

@@ -3,19 +3,14 @@
 
 from pathlib import Path
 
-from gtop import (
-    CpuInfo,
-    MemoryInfo,
-    ResourceUsageSplit,
-    SINFO_COMMAND,
-    ServerState,
-    sort_server_names,
-    SINFO_FIELD_WIDTHS,
-)
-from gtop.accounting import process_jobs
-from gtop.constraints import matches_constraint
+import pytest
+
+from gtop.constants import SACCT_COMMAND, SINFO_COMMAND, SINFO_FIELD_WIDTHS
+from gtop.accounting import process_jobs, summarize_users
+from gtop.constraints import compile_constraint
+from gtop.render_cluster import visible_servers
 from gtop.resources import parse_gpu
-from gtop.slurm import expand_range, parse_features_field, parse_sinfo
+from gtop.slurm import expand_range, parse_features_field, parse_jobs, parse_sinfo
 
 FIXTURE_DIR = Path(__file__).resolve().parent
 
@@ -24,23 +19,19 @@ def read_fixture(name: str) -> str:
     return (FIXTURE_DIR / name).read_text()
 
 
-def test_matches_constraint_basic_boolean_logic():
+def test_compile_constraint_matches_exact_features_with_and_semantics():
     features = {"gpu", "gpu-high", "intel"}
 
-    assert matches_constraint(features, "gpu")
-    assert matches_constraint(features, "gpu&gpu-high")
-    assert matches_constraint(features, "gpu|amd")
-    assert matches_constraint(features, "[gpu-high|gpu-low]")
-    assert matches_constraint(features, "gpu-high*2")
-    assert not matches_constraint(features, "amd")
-    assert not matches_constraint(features, "gpu-high&amd")
+    assert compile_constraint("gpu")(features)
+    assert compile_constraint("gpu,gpu-high")(features)
+    assert not compile_constraint("amd")(features)
+    assert not compile_constraint("gpu-high,amd")(features)
 
 
-def test_matches_constraint_parentheses_respected():
-    features = {"gpu", "gpu-legacy", "amd"}
-
-    assert matches_constraint(features, "gpu|(cpu&amd)")
-    assert not matches_constraint(features, "(cpu&amd)|gpu-high")
+@pytest.mark.parametrize("constraint", ["", "gpu&gpu-high", "gpu|amd", "gpu*2"])
+def test_compile_constraint_rejects_non_feature_syntax(constraint):
+    with pytest.raises(ValueError):
+        compile_constraint(constraint)
 
 
 def test_klara_regular_gpu():
@@ -120,7 +111,7 @@ def test_sinfo_parsing_sample():
 def test_parse_sinfo_unicorn_nodes():
     """Ensure unicorn sinfo fixture is parsed correctly."""
 
-    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"), gpu_only=False)
+    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
 
     assert "klara" in servers
     assert servers["klara"].gpu.num == 8
@@ -133,9 +124,9 @@ def test_parse_sinfo_unicorn_nodes():
 def test_parse_sinfo_g2_fixed_width():
     """g2 sinfo output uses fixed-width columns without whitespace delimiters."""
 
-    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=False)
+    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"))
 
-    # CPU-only nodes should still be present when gpu_only is False
+    # Parsing preserves CPU-only nodes; view policy filters them later.
     assert "g2-cpu-28" in servers
     assert servers["g2-cpu-28"].gpu.num == 0
 
@@ -145,21 +136,14 @@ def test_parse_sinfo_g2_fixed_width():
     assert "gpu-high" in servers["badfellow"].features
 
 
-def test_parse_sinfo_g2_gpu_filters_cpu_nodes():
-    """The gpu flag should remove nodes with null GRES entries."""
-
-    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=True)
-    assert "g2-cpu-28" not in servers
-    assert any(info.gpu.num > 0 for info in servers.values())
-
-
 def test_constraint_filtering_with_fixture():
     """Constraint expressions should narrow the server list as expected."""
 
-    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"), gpu_only=False)
+    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"))
 
+    matches_gpu_high = compile_constraint("gpu-high")
     matching = [
-        name for name, info in servers.items() if matches_constraint(info.features, "gpu-high")
+        name for name, info in servers.items() if matches_gpu_high(info.features)
     ]
 
     assert "sun-compute-01" in matching
@@ -171,18 +155,20 @@ def test_process_jobs_applies_gpu_usage_split():
     """Processing sacct output should attribute GPU usage to nodes."""
 
     sinfo = read_fixture("sinfo-output-g2.txt")
-    servers = parse_sinfo(sinfo, gpu_only=False)
+    servers = parse_sinfo(sinfo)
     gtop_output = read_fixture("gtop-output-g2.txt")
 
-    process_jobs(gtop_output, servers)
+    process_jobs(parse_jobs(gtop_output), servers)
 
     badfellow = servers["badfellow"].usage["gpu"]
-    assert badfellow.gpu == 1.0
-    assert badfellow.default == 2.0
-    assert badfellow.partitions["cuvl"] == 2.0
+    assert badfellow.partitions == {
+        "cuvl": 2.0,
+        "default_partition": 2.0,
+        "gpu": 1.0,
+    }
 
     # CPU nodes should keep zero GPU usage even after processing
-    assert servers["g2-cpu-29"].usage["gpu"].default == 0
+    assert sum(servers["g2-cpu-29"].usage["gpu"].partitions.values()) == 0
 
 
 def test_parse_features_field_strips_multipliers():
@@ -196,80 +182,21 @@ def test_parse_features_field_strips_multipliers():
     assert all("*" not in feature for feature in result)
 
 
-def make_server(
-    name: str,
-    *,
-    features: set[str],
-    gpu_num: int,
-    gpu_priority: float = 0,
-    gpu_default: float = 0,
-    shard_count: int = 0,
-    shard_priority: float = 0,
-    shard_default: float = 0,
-) -> ServerState:
-    server = ServerState(
-        name=name,
-        features=features,
-        gpu=parse_gpu(f"gpu:test:{gpu_num}") if gpu_num > 0 else parse_gpu("(null)"),
-        cpu=CpuInfo(),
-        mem=MemoryInfo(),
+def test_visible_servers_preserves_feature_and_free_capacity_order():
+    servers = parse_sinfo(
+        "\n".join(
+            [
+                "node-b|gpu-low|gpu:test:2|gpu:test:1(IDX:0)|0/0/0/0|0|0",
+                "node-d|gpu-high|gpu:test:4|gpu:test:3(IDX:0-2)|0/0/0/0|0|0",
+                "node-a|gpu-high|gpu:test:4|gpu:test:1(IDX:0)|0/0/0/0|0|0",
+            ]
+        )
     )
-    server.gpu.shards = shard_count
-    server.usage["gpu"] = ResourceUsageSplit(priority=gpu_priority, default=gpu_default)
-    server.usage["shard"] = ResourceUsageSplit(
-        priority=shard_priority,
-        default=shard_default,
-    )
-    return server
 
-
-def test_sort_server_names_by_feature_representation():
-    servers = {
-        "node-b": make_server(
-            "node-b",
-            features={"gpu-low"},
-            gpu_num=2,
-            gpu_priority=1,
-            shard_count=20,
-            shard_priority=4,
-        ),
-        "node-c": make_server("node-c", features=set(), gpu_num=0),
-        "node-a": make_server(
-            "node-a",
-            features={"gpu-high"},
-            gpu_num=4,
-            gpu_priority=1,
-        ),
-        "node-d": make_server(
-            "node-d",
-            features={"gpu-high"},
-            gpu_num=4,
-            gpu_priority=3,
-        ),
-    }
-
-    assert sort_server_names(servers, "feature") == ["node-c", "node-a", "node-d", "node-b"]
-    assert sort_server_names(servers, "name") == ["node-a", "node-b", "node-c", "node-d"]
-    assert sort_server_names(servers, "free-gpu") == ["node-a", "node-b", "node-d", "node-c"]
-    assert sort_server_names(servers, "used-gpu") == ["node-d", "node-a", "node-b", "node-c"]
-    assert sort_server_names(servers, "free-shard", show_shards=True) == [
-        "node-b",
-        "node-a",
-        "node-c",
-        "node-d",
-    ]
-
-
-def test_sort_server_names_counts_gpu_partition_usage():
-    servers = {
-        "node-a": make_server("node-a", features={"gpu"}, gpu_num=4),
-        "node-b": make_server("node-b", features={"gpu"}, gpu_num=4),
-    }
-    servers["node-a"].usage["gpu"] = ResourceUsageSplit(gpu=3)
-    servers["node-b"].usage["gpu"] = ResourceUsageSplit(gpu=1)
-
-    assert sort_server_names(servers, "free-gpu") == ["node-b", "node-a"]
-    assert sort_server_names(servers, "used-gpu") == ["node-a", "node-b"]
+    assert [
+        server.name
+        for server in visible_servers(servers, target_users=None)
+    ] == ["node-a", "node-d", "node-b"]
 
 
 def test_parse_sinfo_fixed_width_line():
@@ -283,55 +210,106 @@ def test_parse_sinfo_fixed_width_line():
         "65536",
     ]
 
-    segments = [
-        value.ljust(width) for value, width in zip(fields, SINFO_FIELD_WIDTHS)
-    ]
+    segments = [value.ljust(width) for value, width in zip(fields, SINFO_FIELD_WIDTHS)]
     fixed_width_line = "".join(segments)
 
-    servers = parse_sinfo(fixed_width_line, gpu_only=False)
+    servers = parse_sinfo(fixed_width_line)
     assert "demo-node" in servers
     assert servers["demo-node"].gpu.num == 4
+    assert servers["demo-node"].cpu.total == 32
     assert servers["demo-node"].mem.total == 65536
 
 
 def test_process_jobs_accepts_pipe_delimited_sacct_output():
-    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"), gpu_only=False)
+    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
     pipe_output = (
         "alice|default_partition|dutta-compute-01|RUNNING|"
         "billing=8,cpu=8,gres/shard:nvidia_h100_nvl=12,gres/shard=12,mem=64G,node=1|12345|"
     )
 
-    process_jobs(pipe_output, servers)
+    process_jobs(parse_jobs(pipe_output), servers)
 
     dutta = servers["dutta-compute-01"]
-    assert dutta.usage["shard"].default == 12
-    assert dutta.usage["gpu"].default == 0
+    assert dutta.usage["shard"].partitions == {"default_partition": 12}
+    assert dutta.usage["gpu"].partitions == {"default_partition": 0}
+
+
+def test_parse_jobs_preserves_an_empty_time_limit_column():
+    jobs = parse_jobs("alice|123|train|RUNNING|gpu|node-a|gres/gpu=1|")
+
+    assert jobs[0].job_id == "123"
+    assert jobs[0].usage.gpu == 1
+    assert jobs[0].time_limit == ""
+
+
+def test_parse_jobs_reads_constraints():
+    jobs = parse_jobs(
+        "alice|123|train|PENDING|gpu|None assigned|gpu-high&ssd|gres/gpu=1|1:00:00|"
+    )
+
+    assert jobs[0].constraints == frozenset({"gpu-high", "ssd"})
+
+
+def test_parse_jobs_preserves_pipe_delimited_constraint_choices():
+    jobs = parse_jobs(
+        "alice|123|train|RUNNING|gpu|node-a|ampere|ada|hopper|gres/gpu=1|1:00:00"
+    )
+
+    assert jobs[0].constraints == frozenset({"ampere", "ada", "hopper"})
+    assert jobs[0].usage.gpu == 1
+    assert jobs[0].time_limit == "1:00:00"
 
 
 def test_process_jobs_converts_gpu_usage_to_shards_on_sharded_nodes():
-    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"), gpu_only=False)
+    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
     pipe_output = (
         "alice|gpu|dutta-compute-01|RUNNING|"
         "billing=8,cpu=8,gres/gpu:nvidia_h100_nvl=2,gres/gpu=2,mem=64G,node=1|12345|"
     )
 
-    process_jobs(pipe_output, servers)
+    jobs = parse_jobs(pipe_output)
+    process_jobs(jobs, servers)
 
     dutta = servers["dutta-compute-01"]
-    assert dutta.usage["gpu"].gpu == 2
-    assert dutta.usage["shard"].gpu == 48
-    assert dutta.users["12345"].gpu == 2
-    assert dutta.users["12345"].shard == 48
+    assert dutta.usage["gpu"].partitions["gpu"] == 2
+    assert dutta.usage["shard"].partitions["gpu"] == 48
+    allocation = dutta.allocations["12345"]
+    assert allocation.job is jobs[0]
+    assert allocation.usage.gpu == 2
+    assert allocation.usage.shard == 48
+    assert jobs[0].usage.gpu == 2
+    assert not hasattr(jobs[0], "usage_str")
+
+    users = summarize_users(servers)
+    assert users["alice"].total_usage() == 2
+
+
+def test_process_jobs_does_not_reallocate_filtered_nodes():
+    servers = parse_sinfo(
+        "\n".join(
+            [
+                "node-1|gpu-high|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
+                "node-2|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
+            ]
+        ),
+    )
+    jobs = parse_jobs(
+        "alice|1|train|RUNNING|gpu|node-[1-2]|cpu=8,gres/gpu=2,mem=32G|1:00:00|"
+    )
+
+    process_jobs(jobs, {"node-1": servers["node-1"]})
+
+    assert servers["node-1"].usage["gpu"].partitions == {"gpu": 1}
+    assert servers["node-1"].usage["cpu"].partitions == {"gpu": 4}
 
 
 def test_sinfo_command_requests_per_node_output():
-    assert " -N " in f" {SINFO_COMMAND} "
+    assert "-N" in SINFO_COMMAND
+    assert "--exact" in SINFO_COMMAND
 
 
 def test_sacct_command_requests_all_users():
-    from gtop import SACCT_COMMAND
-
-    assert " -a " in f" {SACCT_COMMAND} "
+    assert "-a" in SACCT_COMMAND
 
 
 def test_expand_range_preserves_original_width():

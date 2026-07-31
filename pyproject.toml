@@ -10,13 +10,12 @@ authors = [
 ]
 description = "A tool to display SLURM cluster usage with detailed node and resource information."
 readme = "README.md"
-requires-python = ">=3.8"
+license = "MIT"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License", # Choose a license
     "Operating System :: OS Independent",
 ]
-# Add your python script's dependencies here
 dependencies = [
     "rich",
 ]
@@ -37,4 +36,4 @@ dev = [
 ]
 
 [project.scripts]
-gtop = "gtop:main"
+gtop = "gtop.cli:main"

@@ -1,26 +1,18 @@
 from __future__ import annotations
 
-import shlex
-from typing import Optional, Sequence
+from typing import Optional
+
+from .runner import Command
 
 
-def command_option_value(command: str, option_names: Sequence[str]) -> Optional[str]:
-    tokens = shlex.split(command)
-    for index, token in enumerate(tokens):
-        if token in option_names and index + 1 < len(tokens):
-            return tokens[index + 1]
-        for name in option_names:
-            prefix = f"{name}="
-            if token.startswith(prefix):
-                return token[len(prefix) :]
-    return None
-
-
-def remove_command_options(command: str, option_names: Sequence[str]) -> str:
-    tokens = shlex.split(command)
+def set_value_option(
+    command: Command,
+    option_names: tuple[str, ...],
+    value: Optional[str],
+) -> Command:
     filtered: list[str] = []
     skip_next = False
-    for token in tokens:
+    for token in command:
         if skip_next:
             skip_next = False
             continue
@@ -30,13 +22,6 @@ def remove_command_options(command: str, option_names: Sequence[str]) -> str:
         if any(token.startswith(f"{name}=") for name in option_names):
             continue
         filtered.append(token)
-    return shlex.join(filtered)
-
-
-def override_command_option(command: str, option_names: Sequence[str], value: str) -> str:
-    existing = command_option_value(command, option_names)
-    if existing == value:
-        return command
-    filtered = shlex.split(remove_command_options(command, option_names))
-    filtered.extend([option_names[0], value])
-    return shlex.join(filtered)
+    if value is not None:
+        filtered.extend((option_names[0], value))
+    return tuple(filtered)

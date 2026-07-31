@@ -64,6 +64,41 @@ def test_shard_used_tracking():
 
     assert result.used == 1
     assert result.used_shards == 100
+    assert result.occupied(show_shards=False) == 2
+    assert result.occupied(show_shards=True) == 300
+
+
+def test_explicit_shards_contribute_to_physical_gpu_occupancy():
+    gres = "gpu:nvidia_a40:2(S:1),shard:nvidia_a40:400(S:1)"
+    gres_used = "gpu:nvidia_a40:0(IDX:N/A),shard:nvidia_a40:100(100/200)"
+
+    result = parse_gpu(gres, gres_used)
+
+    assert result.occupied(show_shards=False) == 1
+    assert result.occupied(show_shards=True) == 100
+
+
+def test_generic_shards_and_per_device_occupancy():
+    result = parse_gpu(
+        "gpu:2,shard:200",
+        "gpu:0(IDX:N/A),shard:2(1/100,1/100)",
+    )
+
+    assert result.num == 2
+    assert result.shards == 200
+    assert result.shard_gpus_used == 2
+    assert result.occupied(show_shards=False) == 2
+
+
+def test_multiple_shard_capacities_are_summed():
+    result = parse_gpu("gpu:a:2,shard:a:20,gpu:b:2,shard:b:40")
+
+    assert result.num == 4
+    assert result.shards == 60
+
+
+def test_non_gpu_gres_is_not_a_gpu_node():
+    assert parse_gpu("mps:100").type == "null"
 
 
 def test_cpu_only_job():

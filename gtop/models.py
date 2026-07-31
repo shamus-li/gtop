@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Dict, List, Set
+import math
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Set
 
 from .constants import JOB_RESOURCE_NAMES
-from .partitions import partition_bucket
 
 
 @dataclass
@@ -14,11 +14,36 @@ class GpuInfo:
     shards: int = 0
     used: int = 0
     used_shards: int = 0
+    shard_gpus_used: int = 0
+
+    @property
+    def shards_per_gpu(self) -> float:
+        if self.shards <= 0 or self.num <= 0:
+            return 0.0
+        return self.shards / self.num
+
+    def capacity(self, show_shards: bool) -> int:
+        if show_shards and self.shards > 0:
+            return self.shards
+        return self.num
+
+    def occupied(self, show_shards: bool) -> int:
+        shards_per_gpu = self.shards_per_gpu
+        if show_shards and self.shards > 0:
+            return min(
+                self.shards,
+                self.used_shards + int(round(self.used * shards_per_gpu)),
+            )
+        shard_gpus = self.shard_gpus_used
+        if shard_gpus <= 0 and self.used_shards > 0 and shards_per_gpu > 0:
+            shard_gpus = math.ceil(self.used_shards / shards_per_gpu)
+        return min(self.num, self.used + shard_gpus)
 
 
 @dataclass
 class CpuInfo:
     idle: int = 0
+    total: int = 0
 
 
 @dataclass
@@ -29,33 +54,15 @@ class MemoryInfo:
 
 @dataclass
 class ResourceUsageSplit:
-    priority: float = 0.0
-    gpu: float = 0.0
-    default: float = 0.0
     partitions: Dict[str, float] = field(default_factory=dict)
 
-    def total(self) -> float:
-        if self.partitions:
-            return sum(self.partitions.values())
-        return self.priority + self.gpu + self.default
-
     def add(self, partition_name: str, amount: float) -> None:
-        self.partitions[partition_name] = self.partitions.get(partition_name, 0.0) + amount
-        bucket = partition_bucket(partition_name)
-        if bucket is not None:
-            setattr(self, bucket, getattr(self, bucket) + amount)
-
-    def items(self):
-        if self.partitions:
-            return self.partitions.items()
-        return {
-            "priority": self.priority,
-            "gpu": self.gpu,
-            "default": self.default,
-        }.items()
+        self.partitions[partition_name] = (
+            self.partitions.get(partition_name, 0.0) + amount
+        )
 
 
-@dataclass
+@dataclass(frozen=True)
 class JobUsage:
     cpu: float = 0.0
     gpu: float = 0.0
@@ -63,23 +70,7 @@ class JobUsage:
     shard: float = 0.0
 
 
-@dataclass
-class JobAllocation:
-    netid: str
-    job_id: str
-    job_name: str
-    state: str
-    partition: str
-    nodelist: str
-    usage_str: str
-    time_limit: str
-    cpu: float = 0.0
-    gpu: float = 0.0
-    mem: float = 0.0
-    shard: float = 0.0
-
-
-@dataclass
+@dataclass(frozen=True)
 class JobRecord:
     user: str
     job_id: str
@@ -87,12 +78,15 @@ class JobRecord:
     state: str
     partition: str
     nodelist: str
-    usage_str: str
+    usage: JobUsage
     time_limit: str
-    cpu: float = 0.0
-    gpu: float = 0.0
-    mem: float = 0.0
-    shard: float = 0.0
+    constraints: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class NodeAllocation:
+    job: JobRecord
+    usage: JobUsage
 
 
 def _default_usage_splits() -> Dict[str, ResourceUsageSplit]:
@@ -107,67 +101,32 @@ class ServerState:
     cpu: CpuInfo
     mem: MemoryInfo
     usage: Dict[str, ResourceUsageSplit] = field(default_factory=_default_usage_splits)
-    users: Dict[str, JobAllocation] = field(default_factory=dict)
+    allocations: Dict[str, NodeAllocation] = field(default_factory=dict)
 
     def has_target_users(self, target_users: Set[str]) -> bool:
-        return any(job.netid in target_users for job in self.users.values())
+        return any(
+            allocation.job.user in target_users
+            for allocation in self.allocations.values()
+        )
 
 
 @dataclass
-class UserSummary:
-    nodes: Set[str] = field(default_factory=set)
-    usage_by_partition: Dict[str, int] = field(default_factory=dict)
-    priority_usage: int = 0
-    gpu_usage: int = 0
-    default_usage: int = 0
-
-    def total_usage(self) -> int:
-        if self.usage_by_partition:
-            return sum(self.usage_by_partition.values())
-        return self.priority_usage + self.gpu_usage + self.default_usage
-
-
-@dataclass
-class TopUserSummary:
+class UserUsage:
     user: str
     nodes: Set[str] = field(default_factory=set)
     usage_by_partition: Dict[str, int] = field(default_factory=dict)
-    priority_usage: int = 0
-    gpu_usage: int = 0
-    default_usage: int = 0
 
     def total_usage(self) -> int:
-        if self.usage_by_partition:
-            return sum(self.usage_by_partition.values())
-        return self.priority_usage + self.gpu_usage + self.default_usage
+        return sum(self.usage_by_partition.values())
+
+    def add(self, partition: str, amount: int, nodes: Iterable[str]) -> None:
+        self.nodes.update(nodes)
+        self.usage_by_partition[partition] = (
+            self.usage_by_partition.get(partition, 0) + amount
+        )
 
 
 @dataclass
 class ClusterState:
     servers: Dict[str, ServerState] = field(default_factory=dict)
     jobs: List[JobRecord] = field(default_factory=list)
-
-
-@dataclass
-class ClusterSummary:
-    gpu_total: int
-    gpu_used: int
-    gpu_utilization_pct: float
-    resource_label: str
-    target_users: Dict[str, UserSummary] = field(default_factory=dict)
-    top_users: List[TopUserSummary] = field(default_factory=list)
-
-
-def to_jsonable(value: Any) -> Any:
-    if is_dataclass(value):
-        return {
-            item.name: to_jsonable(getattr(value, item.name))
-            for item in fields(value)
-        }
-    if isinstance(value, dict):
-        return {key: to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, set):
-        return sorted(value)
-    if isinstance(value, (list, tuple)):
-        return [to_jsonable(item) for item in value]
-    return value

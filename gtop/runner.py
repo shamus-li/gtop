@@ -5,42 +5,49 @@ from dataclasses import dataclass
 from subprocess import PIPE, Popen, TimeoutExpired
 from typing import Dict, Mapping, Optional, Protocol
 
+Command = tuple[str, ...]
+
 
 @dataclass(frozen=True)
 class CommandResult:
-    command: str
+    command: Command
     stdout: str
     stderr: str
     returncode: int
 
 
 class CommandRunner(Protocol):
-    def run(self, command: str, timeout: int) -> CommandResult:
+    def run(self, command: Command, timeout: int) -> CommandResult:
         ...
 
 
 class SubprocessRunner:
-    def run(self, command: str, timeout: int) -> CommandResult:
+    def run(self, command: Command, timeout: int) -> CommandResult:
         try:
-            process = Popen(command, shell=True, stdout=PIPE, stderr=PIPE)
-            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
+            process = Popen(
+                command,
+                stdout=PIPE,
+                stderr=PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            stdout, stderr = process.communicate(timeout=timeout)
             return CommandResult(
                 command=command,
-                stdout=stdout_bytes.decode("utf-8"),
-                stderr=stderr_bytes.decode("utf-8"),
+                stdout=stdout,
+                stderr=stderr,
                 returncode=process.returncode,
             )
         except TimeoutExpired:
             process.kill()
-            stdout_bytes, stderr_bytes = process.communicate()
-            stderr = stderr_bytes.decode("utf-8")
+            stdout, stderr = process.communicate()
             if stderr:
                 stderr = f"{stderr}\nTimed out after {timeout} seconds"
             else:
                 stderr = f"Timed out after {timeout} seconds"
             return CommandResult(
                 command=command,
-                stdout=stdout_bytes.decode("utf-8"),
+                stdout=stdout,
                 stderr=stderr,
                 returncode=-1,
             )
@@ -54,7 +61,7 @@ class SubprocessRunner:
 
 
 def run_commands(
-    commands: Mapping[str, str],
+    commands: Mapping[str, Command],
     *,
     timeout: int,
     runner: Optional[CommandRunner] = None,
