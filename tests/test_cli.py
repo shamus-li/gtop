@@ -151,6 +151,33 @@ def test_cli_json_output_respects_sort_mode():
     assert payload["summary"]["gpu_total"] == 6
 
 
+def test_cli_json_output_excludes_cpu_only_nodes():
+    sinfo_output = "\n".join(
+        [
+            "gpu-node|gpu|gpu:a100:4(S:0-1)|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0",
+            "cpu-node|cpu|(null)|(null)|0/0/0/16|0|0",
+        ]
+    )
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            SACCT_COMMAND: make_result(SACCT_COMMAND, ""),
+        }
+    )
+    stdout = RecordingConsole()
+
+    code = cli_main(
+        ["--json"],
+        runner=runner,
+        console=stdout,
+        stderr_console=RecordingConsole(),
+    )
+
+    assert code == EXIT_SUCCESS
+    payload = json.loads(stdout.calls[0][0][0])
+    assert [server["name"] for server in payload["servers"]] == ["gpu-node"]
+
+
 def test_cli_partition_scope_applies_to_summary_mode():
     _, sacct_output = make_small_cluster_outputs()
     partition_sinfo_command = f"{SINFO_COMMAND} -p cornell"

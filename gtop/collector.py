@@ -160,13 +160,17 @@ def collect_cluster_state(
             )
         )
 
-    servers = parse_sinfo(sinfo_result.stdout, active_options.gpu_only)
+    servers = parse_sinfo(sinfo_result.stdout, gpu_only=False)
     if not servers:
-        raise (
-            NoMatchingServersError("No servers found matching the criteria.")
-            if active_options.gpu_only
-            else ClusterParseError("Failed to parse any servers from sinfo output.")
-        )
+        raise ClusterParseError("Failed to parse any servers from sinfo output.")
+    if active_options.gpu_only:
+        servers = {
+            name: server
+            for name, server in servers.items()
+            if server.gpu.type != "null"
+        }
+        if not servers:
+            raise NoMatchingServersError("No servers found matching the criteria.")
 
     if constraint is not None and not constraint_fast_path:
         filtered = {

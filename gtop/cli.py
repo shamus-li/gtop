@@ -721,7 +721,7 @@ def cli_main(
         ),
         timeout=args.timeout,
         parallel=not args.no_parallel,
-        gpu_only=not args.json,
+        gpu_only=True,
         partition_filter=partition_filter,
         constraint=args.constraint,
         debug=args.debug,
