@@ -122,6 +122,7 @@ def _format_gpu_name(gpu_type: str) -> str:
     known_tokens = {
         "rtx": "RTX",
         "gtx": "GTX",
+        "gpu": "GPU",
         "hbm": "HBM",
         "nvl": "NVL",
         "pcie": "PCIe",

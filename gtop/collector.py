@@ -127,7 +127,7 @@ def collect_cluster_state(
             for name, server in servers.items()
             if server.gpu.type != "null"
         }
-        if not servers:
+        if not servers and not active_options.allow_empty_servers:
             raise NoMatchingServersError("No servers found matching the criteria.")
 
     if matches is not None:

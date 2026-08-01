@@ -155,13 +155,14 @@ def _filtered_jobs(
         if target_users and job.user not in target_users:
             continue
         assigned_nodes = set(parse_nodelist(job.nodelist))
-        if required_constraints:
-            if assigned_nodes and not (assigned_nodes & server_names):
-                continue
-            if not assigned_nodes and not required_constraints.issubset(
-                job.constraints
-            ):
-                continue
+        if assigned_nodes and not (assigned_nodes & server_names):
+            continue
+        if (
+            required_constraints
+            and not assigned_nodes
+            and not required_constraints.issubset(job.constraints)
+        ):
+            continue
         filtered.append(job)
     return sorted(
         filtered,
@@ -335,7 +336,7 @@ def cli_main(
         sacct_command=sacct_command,
         timeout=args.timeout,
         parallel=not args.no_parallel,
-        gpu_only=view is not View.JOBS,
+        gpu_only=True,
         partition_filter=partition_filter,
         constraint=constraint,
         debug=args.debug,

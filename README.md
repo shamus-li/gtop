@@ -7,6 +7,8 @@
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
 - A login node where `sinfo` and `sacct` can read the cluster state
 
+The parser is tested against captured Cornell Unicorn and Empire AI Slurm output.
+
 ## Install
 
 ```bash

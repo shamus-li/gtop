@@ -1,0 +1,6 @@
+alphacpu01|location=local|(null)|gpu:0|4/92/0/96|0|953674
+alphagh01|location=local|gpu:1|gpu:0|0/0/72/72|0|1
+alphagpu01|location=local,nvidia_h100,xeon_8568y|gpu:nvidia_h100_80gb_hbm3:8(S:0-1)|gpu:nvidia_h100_80gb_hbm3:8(IDX:0-7)|96/0/0/96|0|1907348
+alphagpu01|location=local,nvidia_h100,xeon_8568y|gpu:nvidia_h100_80gb_hbm3:8(S:0-1)|gpu:nvidia_h100_80gb_hbm3:8(IDX:0-7)|96/0/0/96|0|1907348
+alphagpu24|location=local,nvidia_h200,xeon_8568y|gpu:nvidia_h200:8(S:0-1)|gpu:nvidia_h200:0(IDX:N/A)|0/96/0/96|0|1907348
+alphagpu24|location=local,nvidia_h200,xeon_8568y|gpu:nvidia_h200:8(S:0-1)|gpu:nvidia_h200:0(IDX:N/A)|0/96/0/96|0|1907348
