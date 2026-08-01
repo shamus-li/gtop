@@ -819,11 +819,12 @@ def test_cli_help_contains_display_legend():
 
     assert "Core options:" in help_text
     assert "Debug options:" in help_text
-    assert "violet (#c764f4) = priority" in help_text
-    assert "mint green (#4fd3a1) = gpu" in help_text
-    assert "light blue (#88b4ff) = default" in help_text
-    assert "blue gray (#a4b0be) = unattributed usage" in help_text
-    assert "dim gray dots = free" in help_text
+    assert help_text.count("████") == 4
+    assert "████\033[0m = priority" in help_text
+    assert "████\033[0m = gpu" in help_text
+    assert "████\033[0m = default" in help_text
+    assert "████\033[0m = unattributed usage" in help_text
+    assert "dots = free" not in help_text
     assert "counts after bars: priority / gpu / default" in help_text
 
 

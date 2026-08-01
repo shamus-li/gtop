@@ -409,14 +409,17 @@ def cli_main(
                 active_console,
                 partitions=partition_filter,
             )
-        active_console.print(
-            render_jobs_view(
-                jobs,
-                title=title,
-                servers=state.servers,
-                width=getattr(active_console, "width", None),
-            )
+        job_view = render_jobs_view(
+            jobs,
+            title=title,
+            servers=state.servers,
+            width=getattr(active_console, "width", None),
         )
+        for renderable in job_view.renderables:
+            active_console.print(
+                renderable,
+                soft_wrap=isinstance(renderable, Text),
+            )
         return EXIT_SUCCESS
 
     servers = visible_servers(

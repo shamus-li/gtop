@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Dict, List, Optional
+from typing import Collection, Dict, List, Optional
 
 from .constants import SINFO_FIELD_WIDTHS
 from .constraints import requested_constraint_features
@@ -125,13 +125,30 @@ def _valid_job_fields(
     )
 
 
-def parse_jobs(output: str) -> List[JobRecord]:
+def parse_jobs(
+    output: str,
+    *,
+    states: Optional[Collection[str]] = None,
+) -> List[JobRecord]:
     jobs: List[JobRecord] = []
     if not output.strip():
         return jobs
 
     for line_number, line in enumerate(output.strip().splitlines(), start=1):
-        parts = _split_job_line(line.strip())
+        stripped_line = line.strip()
+        if states is not None and "|" in stripped_line:
+            state_fields = stripped_line.split("|", 4)
+            if len(state_fields) >= 4:
+                state = _canonical_job_state(state_fields[3])
+                state_code = state.replace("_", "")
+                if (
+                    state_code.isalpha()
+                    and state_code.isupper()
+                    and state not in states
+                ):
+                    continue
+
+        parts = _split_job_line(stripped_line)
         if not parts:
             raise ValueError(f"Malformed sacct record on line {line_number}")
         if len(parts) >= 10 and parts[-1] == "" and (not parts[-3] or "=" in parts[-3]):
@@ -161,6 +178,8 @@ def parse_jobs(output: str) -> List[JobRecord]:
         state = _canonical_job_state(state)
         if not _valid_job_fields(user, job_id, state, usage_str):
             raise ValueError(f"Malformed sacct record on line {line_number}")
+        if states is not None and state not in states:
+            continue
         try:
             usage = parse_usage(usage_str)
         except ValueError as error:

@@ -126,6 +126,21 @@ def test_parse_jobs_canonicalizes_decorated_running_state():
     assert servers["node-1"].usage["gpu"].partitions == {"gpu": 1}
 
 
+def test_parse_jobs_skips_inactive_rows_before_resource_parsing():
+    output = "\n".join(
+        [
+            "alice|1|train|RUNNING|gpu|node-1|gres/gpu=1|1:00:00|",
+            "alice|2|done|COMPLETED|gpu|node-1|gres/gpu=invalid|1:00:00|",
+        ]
+    )
+
+    jobs = parse_jobs(output, states={"RUNNING", "PENDING", "REQUEUED"})
+
+    assert [job.job_id for job in jobs] == ["1"]
+    with pytest.raises(ValueError, match="Invalid resource value"):
+        parse_jobs(output)
+
+
 def test_parse_jobs_rejects_empty_state():
     with pytest.raises(ValueError, match="Malformed sacct record"):
         parse_jobs("alice|1|train||gpu|node-1|gres/gpu=1|1:00:00|")

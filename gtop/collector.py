@@ -142,8 +142,10 @@ def collect_cluster_state(
     try:
         active_jobs_by_id = {
             job.job_id: job
-            for job in parse_jobs(sacct_result.stdout)
-            if job.state in ACTIVE_JOB_STATES
+            for job in parse_jobs(
+                sacct_result.stdout,
+                states=ACTIVE_JOB_STATES,
+            )
         }
     except ValueError as error:
         raise ClusterParseError(str(error)) from error

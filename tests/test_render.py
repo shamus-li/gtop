@@ -77,13 +77,16 @@ def _job() -> JobRecord:
 
 def test_canonical_palette_and_legend_are_shared_by_help():
     assert SEMANTIC_PALETTE == {
-        "priority": ("violet", "#c764f4"),
-        "gpu": ("mint green", "#4fd3a1"),
-        "default": ("light blue", "#88b4ff"),
+        "priority": "#c764f4",
+        "gpu": "#4fd3a1",
+        "default": "#88b4ff",
     }
     assert all(
         line in build_parser().format_help() for line in SEMANTIC_LEGEND.splitlines()
     )
+    assert SEMANTIC_LEGEND.count("████") == 4
+    assert "violet" not in SEMANTIC_LEGEND
+    assert "free" not in SEMANTIC_LEGEND
 
 
 @pytest.mark.parametrize(

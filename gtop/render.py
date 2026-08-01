@@ -19,21 +19,29 @@ from .partitions import SEMANTIC_PARTITIONS, partition_bucket
 
 TOP_USER_BAR_WIDTH = 12
 SEMANTIC_PALETTE = {
-    "priority": ("violet", "#c764f4"),
-    "gpu": ("mint green", "#4fd3a1"),
-    "default": ("light blue", "#88b4ff"),
+    "priority": "#c764f4",
+    "gpu": "#4fd3a1",
+    "default": "#88b4ff",
 }
+OTHER_PARTITION_COLOR = "#a4b0be"
+
+
+def _legend_bar(color: str) -> str:
+    red, green, blue = (
+        int(color[index : index + 2], 16) for index in (1, 3, 5)
+    )
+    return f"\033[38;2;{red};{green};{blue}m████\033[0m"
+
+
 SEMANTIC_LEGEND = "\n".join(
     [
         *(
-            f"{label} ({color}) = {partition}"
-            for partition, (label, color) in SEMANTIC_PALETTE.items()
+            f"{_legend_bar(color)} = {partition}"
+            for partition, color in SEMANTIC_PALETTE.items()
         ),
-        "blue gray (#a4b0be) = unattributed usage",
-        "dim gray dots = free",
+        f"{_legend_bar(OTHER_PARTITION_COLOR)} = unattributed usage",
     ]
 )
-OTHER_PARTITION_COLOR = "#a4b0be"
 NODE_COUNT_COLOR = "white"
 
 
@@ -59,7 +67,7 @@ def _top_user_label(user: str, *, include_full_name: bool = True) -> str:
 
 def _partition_color(partition: str) -> str:
     bucket = partition_bucket(partition)
-    return OTHER_PARTITION_COLOR if bucket is None else SEMANTIC_PALETTE[bucket][1]
+    return OTHER_PARTITION_COLOR if bucket is None else SEMANTIC_PALETTE[bucket]
 
 
 def _usage_partitions(usage_info: ResourceUsageSplit) -> dict[str, float]:
