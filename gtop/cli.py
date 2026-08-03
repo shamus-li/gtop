@@ -37,7 +37,7 @@ from .constants import (
 from .models import JobRecord, UserUsage
 from .partitions import partition_names
 from .render import (
-    SEMANTIC_LEGEND,
+    help_legend,
     print_filtered_users,
     print_top_users,
 )
@@ -55,6 +55,12 @@ class View(Enum):
     NODES = "nodes"
     JOBS = "jobs"
     TOP_USERS = "top-users"
+
+
+class GtopArgumentParser(argparse.ArgumentParser):
+    def print_help(self, file: Optional[Any] = None) -> None:
+        super().print_help(file)
+        Console(file=file).print(help_legend())
 
 
 def _write_json_output(json_text: str, console: Optional[Any]) -> None:
@@ -176,14 +182,8 @@ def _filtered_jobs(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = GtopArgumentParser(
         description="Show live SLURM GPU capacity and usage",
-        epilog=(
-            "Legend:\n"
-            + "\n".join(f"  {line}" for line in SEMANTIC_LEGEND.splitlines())
-            + "\n"
-            "  counts after bars: priority / gpu / default"
-        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     core = parser.add_argument_group("Core options")

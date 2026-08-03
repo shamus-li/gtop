@@ -26,22 +26,17 @@ SEMANTIC_PALETTE = {
 OTHER_PARTITION_COLOR = "#a4b0be"
 
 
-def _legend_bar(color: str) -> str:
-    red, green, blue = (
-        int(color[index : index + 2], 16) for index in (1, 3, 5)
-    )
-    return f"\033[38;2;{red};{green};{blue}m████\033[0m"
-
-
-SEMANTIC_LEGEND = "\n".join(
-    [
-        *(
-            f"{_legend_bar(color)} = {partition}"
-            for partition, color in SEMANTIC_PALETTE.items()
-        ),
-        f"{_legend_bar(OTHER_PARTITION_COLOR)} = unattributed usage",
-    ]
-)
+def help_legend() -> Text:
+    legend = Text("\nLegend:\n")
+    for partition, color in SEMANTIC_PALETTE.items():
+        legend.append("  ")
+        legend.append("████", style=f"dim {color}")
+        legend.append(f" = {partition}\n")
+    legend.append("  ")
+    legend.append("████", style=f"dim {OTHER_PARTITION_COLOR}")
+    legend.append(" = unattributed usage\n")
+    legend.append("  counts after bars: priority / gpu / default")
+    return legend
 NODE_COUNT_COLOR = "white"
 
 
@@ -227,10 +222,11 @@ def _build_bar(
         [count for _, count, _ in segments] + [free],
         width,
     )
-    bar = Text("[", style="dim")
+    bar = Text()
+    bar.append("[", style="dim")
     for (_, _, color), segment_length in zip(segments, lengths[:-1]):
         if segment_length:
-            bar.append("█" * segment_length, style=color)
+            bar.append("█" * segment_length, style=f"dim {color}")
     if lengths[-1]:
         bar.append("·" * lengths[-1], style="dim")
     bar.append("]", style="dim")

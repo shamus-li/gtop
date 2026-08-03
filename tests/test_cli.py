@@ -814,16 +814,18 @@ def test_cli_text_and_json_use_sinfo_occupancy_for_availability():
 
 def test_cli_help_contains_display_legend():
     parser = build_parser()
+    stream = io.StringIO()
 
-    help_text = parser.format_help()
+    parser.print_help(stream)
+    help_text = stream.getvalue()
 
     assert "Core options:" in help_text
     assert "Debug options:" in help_text
     assert help_text.count("████") == 4
-    assert "████\033[0m = priority" in help_text
-    assert "████\033[0m = gpu" in help_text
-    assert "████\033[0m = default" in help_text
-    assert "████\033[0m = unattributed usage" in help_text
+    assert "████ = priority" in help_text
+    assert "████ = gpu" in help_text
+    assert "████ = default" in help_text
+    assert "████ = unattributed usage" in help_text
     assert "dots = free" not in help_text
     assert "counts after bars: priority / gpu / default" in help_text
 
