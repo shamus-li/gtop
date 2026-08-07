@@ -253,6 +253,7 @@ def _resource_row(
     show_total: bool,
     include_bar: bool,
     include_split: bool,
+    bar_widths: Mapping[str, int] = BAR_WIDTHS,
 ) -> list[Text]:
     cells: list[Text] = []
     for resource in resources:
@@ -280,7 +281,7 @@ def _resource_row(
                 _build_bar(
                     bar_partitions,
                     free=max(total - occupied, 0),
-                    width=BAR_WIDTHS[resource],
+                    width=bar_widths[resource],
                 )
             )
         if include_split:
@@ -522,6 +523,20 @@ def _nodes_table(
         bar_widths=[BAR_WIDTHS[resource] + 2 for resource in resources],
         split_widths=[split_widths[resource] for resource in resources],
     )
+    bar_widths = BAR_WIDTHS
+    if not include_bar:
+        for compact_width in range(min(BAR_WIDTHS.values()), 2, -1):
+            compact_widths = {resource: compact_width for resource in resources}
+            if _fits_width(
+                width,
+                [
+                    *required_widths,
+                    *(compact_widths[resource] + 2 for resource in resources),
+                ],
+            ):
+                bar_widths = compact_widths
+                include_bar = True
+                break
 
     table = _data_table(show_header=show_header)
     table.add_column(
@@ -551,6 +566,7 @@ def _nodes_table(
                 show_total=True,
                 include_bar=include_bar,
                 include_split=include_split,
+                bar_widths=bar_widths,
             ),
         )
     return table
@@ -593,6 +609,18 @@ def render_table(
     overview_title: str = "Cluster Overview",
     verbose: bool = False,
 ) -> Any:
+    if show_used and not verbose:
+        servers = [
+            server
+            for server in servers
+            if _resource_numbers(
+                server,
+                "gpu",
+                show_shards=show_shards,
+                show_used=True,
+            )[0]
+            > 0
+        ]
     groups = _group_servers(
         servers,
         show_shards=show_shards,
@@ -607,14 +635,15 @@ def render_table(
         )
     ]
     if not verbose:
-        renderables.append(
-            _summary_table(
-                groups,
-                show_shards=show_shards,
-                show_used=show_used,
-                width=width,
+        if groups:
+            renderables.append(
+                _summary_table(
+                    groups,
+                    show_shards=show_shards,
+                    show_used=show_used,
+                    width=width,
+                )
             )
-        )
         return Group(*renderables)
 
     all_grouped_servers = [

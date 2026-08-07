@@ -830,7 +830,8 @@ def test_cli_help_contains_display_legend():
     assert "counts after bars: priority / gpu / default" in help_text
 
 
-def test_cli_verbose_table_aligns_bars_across_rows():
+@pytest.mark.parametrize("width", [80, 140])
+def test_cli_verbose_table_aligns_bars_across_rows(width: int):
     sinfo_output, sacct_output = make_small_cluster_outputs()
     runner = FakeRunner(
         {
@@ -839,7 +840,7 @@ def test_cli_verbose_table_aligns_bars_across_rows():
         }
     )
     stream = io.StringIO()
-    console = Console(file=stream, width=140, force_terminal=False)
+    console = Console(file=stream, width=width, force_terminal=False)
 
     code = cli_main(
         ["-v"],
@@ -851,6 +852,7 @@ def test_cli_verbose_table_aligns_bars_across_rows():
     output = stream.getvalue().splitlines()
     row_lines = [line for line in output if "node-a" in line or "node-b" in line]
     assert code == EXIT_SUCCESS
+    assert max(len(line) for line in output) <= width
     assert len(row_lines) == 2
     assert row_lines[0].index("[") == row_lines[1].index("[")
     assert row_lines[0].index("[", row_lines[0].index("[") + 1) == row_lines[1].index(
@@ -1253,13 +1255,55 @@ def test_cli_filtered_user_view_shows_user_usage_not_cluster_free():
 
     output = stream.getvalue()
     assert code == EXIT_SUCCESS
-    assert "Filtered Usage  1 GPU used" in output
+    assert "Usage  1 GPU used" in output
     assert "1 GPU used" in output
     assert "A100" in output
     assert "node-a" not in output
     assert "1/0/0" in output
     assert "node-b" not in output
     assert "3/4 GPUs free" not in output
+
+
+def test_cli_filtered_summary_hides_cpu_only_gpu_nodes():
+    sinfo_output = (
+        "node-a|gpu|gpu:a6000:4(S:0)|gpu:a6000:4(IDX:0-3)|0/0/0/0|0|0"
+    )
+    sacct_output = (
+        "alice|gpu|node-a|RUNNING|billing=16,cpu=16,mem=32G,node=1|101|"
+    )
+    command = filtered_collect_command("alice")
+    responses = {
+        SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+        command: make_result(command, sacct_output),
+    }
+    stream = io.StringIO()
+
+    code = cli_main(
+        ["--users", "alice"],
+        runner=FakeRunner(responses),
+        console=Console(file=stream, width=100, force_terminal=False),
+        stderr_console=RecordingConsole(),
+    )
+    json_output = RecordingConsole()
+    json_code = cli_main(
+        ["--json", "--users", "alice"],
+        runner=FakeRunner(responses),
+        console=json_output,
+        stderr_console=RecordingConsole(),
+    )
+
+    payload = json.loads(json_output.calls[0][0][0])
+    assert code == json_code == EXIT_SUCCESS
+    assert "Usage  0 GPUs used" in stream.getvalue()
+    assert "GPU Type" not in stream.getvalue()
+    assert "A6000" not in stream.getvalue()
+    assert payload["capacity"] == {
+        "free": 0,
+        "total": 0,
+        "unit": "GPU",
+        "used": 0,
+    }
+    assert payload["gpu_types"] == []
 
 
 def test_cli_three_way_partition_split_distinguishes_gpu_partition():
@@ -1322,7 +1366,7 @@ def test_cli_filtered_user_summary_counts_shard_usage_as_gpu_occupancy():
 
     output = stream.getvalue()
     assert code == EXIT_SUCCESS
-    assert "Filtered Usage  1 GPU used" in output
+    assert "Usage  1 GPU used" in output
     assert "GB10" in output
     assert "1" in output
 

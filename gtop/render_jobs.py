@@ -277,12 +277,12 @@ def _capacity_table(groups: Sequence[_JobGroup], *, width: Optional[int]) -> Tab
 _DETAIL_HEADERS = (
     "ID",
     "Node",
+    "State",
+    "User",
+    "Partition",
     "GPU",
     "CPU",
     "MEM",
-    "Partition",
-    "State",
-    "User",
     "Time",
     "Name",
 )
@@ -302,6 +302,9 @@ def _job_rows(
             (
                 job.job_id,
                 assignment,
+                _job_state_label(job.state),
+                job.user,
+                job.partition or "-",
                 _job_gpu_value(
                     job,
                     unit=units.get(assignment, "GPU"),
@@ -309,9 +312,6 @@ def _job_rows(
                 ),
                 _job_cpu_value(job),
                 _job_mem_value(job),
-                job.partition or "-",
-                _job_state_label(job.state),
-                job.user,
                 job.time_limit or "-",
                 job.job_name or "-",
             )
@@ -337,37 +337,50 @@ def _job_cards(rows: Sequence[tuple[str, ...]]) -> Text:
             }.get(label, "white")
             cards.append(values[label], style=style)
         cards.append("\nGPU/CPU/MEM: ", style="bold white")
-        cards.append("/".join(row[2:5]), style="white")
+        cards.append(
+            "/".join(values[label] for label in ("GPU", "CPU", "MEM")),
+            style="white",
+        )
     return cards
 
 
 def _job_details(rows: Sequence[tuple[str, ...]], *, width: Optional[int]) -> Any:
-    widths = [
-        _max_width(header, [row[index] for row in rows])
-        for index, header in enumerate(_DETAIL_HEADERS)
+    show_node = len({row[1] for row in rows}) > 1
+    headers = [
+        header for header in _DETAIL_HEADERS if show_node or header != "Node"
     ]
-    if not _fits_width(width, widths):
+    minimum_widths = [
+        max(len(header), 12 if header == "Name" else 0)
+        for header in headers
+    ]
+    if not _fits_width(width, minimum_widths):
         return _job_cards(rows)
 
     table = _data_table(show_header=True)
-    for index, label in enumerate(_DETAIL_HEADERS):
+    for label in headers:
+        wraps = label not in {"State", "GPU", "CPU", "MEM"}
         table.add_column(
             label,
             header_style="bold white",
             justify="right" if label in {"GPU", "CPU", "MEM", "Time"} else "left",
-            no_wrap=True,
+            no_wrap=not wraps,
+            overflow="fold" if wraps else "ellipsis",
+            min_width=12 if label == "Name" else len(label),
         )
     for row in rows:
-        table.add_row(
+        cells = [
             Text(row[0], style="dim"),
             Text(row[1], style="cyan"),
-            *(Text(value, style="white") for value in row[2:5]),
-            Text(row[5], style=_partition_color(row[5])),
-            Text(row[6], style=_job_state_style(row[6])),
-            Text(row[7], style="cyan"),
+            Text(row[2], style=_job_state_style(row[2])),
+            Text(row[3], style="cyan"),
+            Text(row[4], style=_partition_color(row[4])),
+            *(Text(value, style="white") for value in row[5:8]),
             Text(row[8], style="white"),
             Text(row[9], style="white"),
-        )
+        ]
+        if not show_node:
+            cells.pop(1)
+        table.add_row(*cells)
     return table
 
 

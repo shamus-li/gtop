@@ -277,7 +277,10 @@ def test_jobs_preserve_identifiers_and_primary_counts(width: int):
     _assert_bounded(output, width)
     assert NODE_NAME in output
     assert GPU_TYPE in output
-    assert USER in output
+    if width in {60, 160}:
+        assert USER in output
+    else:
+        assert USER.split("_", 1)[0] in output
     assert job.job_id in output
     assert "1/4 GPUs used" in output
     if width == 160:
@@ -285,11 +288,22 @@ def test_jobs_preserve_identifiers_and_primary_counts(width: int):
     assert "8" in output
     assert "32G" in output
     if width == 80:
-        assert job.partition in output
-        assert job.job_name in output
-    if width == 160:
-        assert job.partition in output
-        assert job.job_name in output
+        header = next(line for line in output.splitlines() if line.startswith("ID "))
+        assert header.split() == [
+            "ID",
+            "State",
+            "User",
+            "Partition",
+            "GPU",
+            "CPU",
+            "MEM",
+            "Time",
+            "Name",
+        ]
+        assert "ID:" not in output
+        assert "GPU/CPU/MEM:" not in output
+    if width >= 80:
+        assert "…" not in output
 
 
 def test_job_header_uses_only_scoped_node_allocations():

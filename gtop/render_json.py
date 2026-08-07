@@ -36,6 +36,7 @@ def summary_json(
     servers: Sequence[ServerState],
     *,
     show_shards: bool,
+    show_used: bool = False,
 ) -> dict[str, Any]:
     unit = "shard" if show_shards else "GPU"
     grouped: dict[str, list[ServerState]] = {}
@@ -43,9 +44,10 @@ def summary_json(
         grouped.setdefault(_display_gpu_type(server), []).append(server)
 
     gpu_types = []
+    total_capacity = 0
+    total_used = 0.0
     for gpu_type, grouped_servers in sorted(grouped.items()):
         total = sum(server.gpu.capacity(show_shards) for server in grouped_servers)
-        used = sum(server.gpu.occupied(show_shards) for server in grouped_servers)
         partition_totals: dict[str, float] = {}
         for server in grouped_servers:
             usage = (
@@ -57,6 +59,15 @@ def summary_json(
                 partition_totals[partition] = (
                     partition_totals.get(partition, 0.0) + amount
                 )
+        used = (
+            sum(partition_totals.values())
+            if show_used
+            else sum(server.gpu.occupied(show_shards) for server in grouped_servers)
+        )
+        if show_used and used <= 0:
+            continue
+        total_capacity += total
+        total_used += used
 
         gpu_types.append(
             {
@@ -69,8 +80,8 @@ def summary_json(
     return {
         "view": "summary",
         "capacity": _capacity(
-            total=sum(server.gpu.capacity(show_shards) for server in servers),
-            used=sum(server.gpu.occupied(show_shards) for server in servers),
+            total=total_capacity,
+            used=total_used,
             unit=unit,
         ),
         "gpu_types": gpu_types,

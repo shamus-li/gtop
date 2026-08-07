@@ -144,9 +144,9 @@ def _overview_title(
         prefix = "Partition" if len(partition_filter) == 1 else "Partitions"
         label = _partition_scope_label(partition_filter)
         if target_users:
-            return f"Filtered Usage ({prefix.lower()} {label})"
+            return f"Usage ({prefix.lower()} {label})"
         return f"{prefix} {label}"
-    return "Filtered Usage" if target_users else "Cluster Overview"
+    return "Usage" if target_users else "Cluster Overview"
 
 
 def _filtered_jobs(
@@ -482,6 +482,7 @@ def cli_main(
             payload = summary_json(
                 display_servers,
                 show_shards=args.shard,
+                show_used=bool(target_user_filter),
             )
         _write_json_output(json.dumps(payload, indent=2, sort_keys=True), console)
         return EXIT_SUCCESS
