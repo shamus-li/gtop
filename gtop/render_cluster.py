@@ -91,7 +91,7 @@ def _resource_numbers(
         total = server.gpu.capacity(show_shards)
         occupied = min(server.gpu.occupied(show_shards), total)
         count = used if show_used else max(total - occupied, 0)
-        return count, total, partition_amounts, occupied
+        return count, total, partition_amounts, used if show_used else occupied
     if resource == "cpu":
         total = server.cpu.total
         occupied = min(max(total - server.cpu.idle, 0), total)
@@ -99,13 +99,18 @@ def _resource_numbers(
             used if show_used else server.cpu.idle,
             total,
             partition_amounts,
-            occupied,
+            used if show_used else occupied,
         )
 
     total = int(round(server.mem.total / 1024.0))
     free = int(round(server.mem.idle / 1024.0))
     occupied = min(max(total - free, 0), total)
-    return (used if show_used else free), total, partition_amounts, occupied
+    return (
+        used if show_used else free,
+        total,
+        partition_amounts,
+        used if show_used else occupied,
+    )
 
 
 def _split_group_gpu_types(gpu_type: str) -> list[str]:

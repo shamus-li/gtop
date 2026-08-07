@@ -1199,7 +1199,7 @@ def test_cli_user_summary_treats_brackets_as_plain_text():
 
     output = stream.getvalue()
     assert code == EXIT_SUCCESS
-    assert "Filtered Users" in output
+    assert output.splitlines()[0] == "User"
     assert "alice[lab]" in output
     assert "priority[queue]" in output
     assert "Summary of Resources Used by Specified Users" not in output

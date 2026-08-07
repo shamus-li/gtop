@@ -530,6 +530,8 @@ def print_filtered_users(
             row.append(breakdown)
         table.add_row(*row)
 
-    active_console.print(Text("Filtered Users", style="bold cyan"))
+    active_console.print(
+        Text(_pluralize(len(visible_users), "User"), style="bold cyan")
+    )
     active_console.print(table)
     active_console.print()

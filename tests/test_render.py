@@ -24,6 +24,7 @@ from gtop.render import (
     _display_gpu_type,
     _partition_segments,
     help_legend,
+    print_filtered_users,
     print_top_users,
 )
 from gtop.partitions import partition_bucket
@@ -96,6 +97,21 @@ def test_canonical_palette_and_legend_are_shared_by_help():
     ]
 
 
+def test_filtered_users_heading_is_plural_for_multiple_users():
+    console, stream = _console(100)
+
+    print_filtered_users(
+        {
+            "alice": UserUsage(user="alice", usage_by_partition={"gpu": 1}),
+            "bob": UserUsage(user="bob", usage_by_partition={"gpu": 1}),
+        },
+        unit="GPU",
+        console=console,
+    )
+
+    assert stream.getvalue().splitlines()[0] == "Users"
+
+
 @pytest.mark.parametrize(
     ("partition", "bucket"),
     [
@@ -139,7 +155,7 @@ def test_mixed_gpu_types_use_readable_names():
     assert _display_gpu_type(server) == "A6000 + A100 PCIe 40GB"
 
 
-def test_filtered_bar_distinguishes_other_occupancy_from_free_capacity():
+def test_filtered_bar_only_shows_selected_usage():
     server = _server()
     server.gpu.num = 8
     server.gpu.used = 6
@@ -163,8 +179,8 @@ def test_filtered_bar_distinguishes_other_occupancy_from_free_capacity():
     )
 
     bar = cells[1]
-    assert bar.plain == "[██████··]"
-    assert any(str(span.style) == "dim #a4b0be" for span in bar.spans)
+    assert bar.plain == "[██······]"
+    assert all(str(span.style) != "dim #a4b0be" for span in bar.spans)
 
 
 def test_resource_headers_name_free_and_used_counts():
