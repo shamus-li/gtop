@@ -99,7 +99,6 @@ def _sacct_command(
     *,
     states: Optional[Sequence[str]],
     users: Optional[Set[str]] = None,
-    partitions: Optional[Sequence[str]] = None,
 ) -> Command:
     updated = set_value_option(
         command,
@@ -111,12 +110,6 @@ def _sacct_command(
             updated,
             ("--user", "--users"),
             ",".join(sorted(users)),
-        )
-    if partitions:
-        updated = set_value_option(
-            updated,
-            ("--partition", "--partitions"),
-            ",".join(partitions),
         )
     return updated
 
@@ -233,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-p",
         "--partition",
         nargs="+",
-        help="Scope results to one or more partitions",
+        help="Show usage on nodes in one or more partitions",
     )
     core.add_argument(
         "-s",
@@ -317,7 +310,6 @@ def cli_main(
             sacct_base_command,
             states=None,
             users=target_user_filter,
-            partitions=partition_filter,
         )
     else:
         sacct_command = (
@@ -325,9 +317,8 @@ def cli_main(
                 sacct_base_command,
                 states=("RUNNING",),
                 users=target_user_filter,
-                partitions=partition_filter,
             )
-            if target_user_filter or partition_filter
+            if target_user_filter
             else sacct_base_command
         )
 

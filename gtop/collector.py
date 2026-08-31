@@ -17,7 +17,7 @@ from .constants import (
 from .models import ClusterState
 from .partitions import normalize_partition_name, partition_names
 from .runner import Command, CommandResult, CommandRunner, run_commands
-from .slurm import parse_jobs, parse_sinfo
+from .slurm import parse_jobs, parse_nodelist, parse_sinfo
 
 
 @dataclass(frozen=True)
@@ -150,17 +150,23 @@ def collect_cluster_state(
     except ValueError as error:
         raise ClusterParseError(str(error)) from error
     jobs = list(active_jobs_by_id.values())
-    if active_options.partition_filter:
-        partitions = {
-            normalize_partition_name(partition)
-            for partition in active_options.partition_filter
-        }
-        jobs = [
-            job
-            for job in jobs
-            if partitions.intersection(partition_names(job.partition))
-        ]
     try:
+        if active_options.partition_filter:
+            partitions = {
+                normalize_partition_name(partition)
+                for partition in active_options.partition_filter
+            }
+            scoped_jobs = []
+            for job in jobs:
+                nodes = parse_nodelist(job.nodelist)
+                # Shared partitions can allocate jobs on the same physical nodes.
+                if nodes:
+                    if not any(node in servers for node in nodes):
+                        continue
+                elif not partitions.intersection(partition_names(job.partition)):
+                    continue
+                scoped_jobs.append(job)
+            jobs = scoped_jobs
         process_jobs(
             jobs,
             servers,

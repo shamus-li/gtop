@@ -281,11 +281,7 @@ def test_cli_filtered_nodes_json_separates_capacity_from_usage():
 def test_cli_partition_scope_applies_to_summary_mode():
     _, sacct_output = make_small_cluster_outputs()
     partition_sinfo_command = (*SINFO_COMMAND, "-p", "cornell")
-    partition_sacct_command = _sacct_command(
-        SACCT_COMMAND,
-        states=("RUNNING",),
-        partitions=("cornell",),
-    )
+    partition_sacct_command = SACCT_COMMAND
     runner = FakeRunner(
         {
             partition_sinfo_command: make_result(
@@ -311,25 +307,25 @@ def test_cli_partition_scope_applies_to_summary_mode():
     payload = json.loads(stdout.calls[0][0][0])
     assert payload["capacity"]["total"] == 4
     assert payload["gpu_types"][0]["type"] == "A100"
+    assert payload["gpu_types"][0]["usage"]["partitions"] == {
+        "priority_partition": 1
+    }
     assert runner.calls == [
         (partition_sinfo_command, DEFAULT_TIMEOUT),
         (partition_sacct_command, DEFAULT_TIMEOUT),
     ]
 
 
-def test_cli_top_users_respects_partition_scope():
+def test_cli_top_users_includes_shared_partition_usage_on_scoped_nodes():
     sacct_output = "\n".join(
         [
             "alice|cornell|node-a|RUNNING|billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|101|",
             "bob|other|node-a|RUNNING|billing=8,cpu=8,gres/gpu=2,mem=32G,node=1|102|",
+            "charlie|cornell|node-b|RUNNING|billing=8,cpu=8,gres/gpu=2,mem=32G,node=1|103|",
         ]
     )
     partition_sinfo_command = (*SINFO_COMMAND, "-p", "cornell")
-    partition_sacct_command = _sacct_command(
-        SACCT_COMMAND,
-        states=("RUNNING",),
-        partitions=("cornell",),
-    )
+    partition_sacct_command = SACCT_COMMAND
     runner = FakeRunner(
         {
             partition_sinfo_command: make_result(
@@ -356,7 +352,8 @@ def test_cli_top_users_respects_partition_scope():
     assert code == EXIT_SUCCESS
     assert "Partition scope: cornell" in output
     assert "alice" in output
-    assert "bob" not in output
+    assert "bob" in output
+    assert "charlie" not in output
     assert runner.calls == [
         (partition_sinfo_command, DEFAULT_TIMEOUT),
         (partition_sacct_command, DEFAULT_TIMEOUT),
@@ -387,7 +384,6 @@ def test_cli_filtered_human_no_match_prints_one_message():
         SACCT_COMMAND,
         states=("RUNNING",),
         users={"nobody"},
-        partitions=("gpu",),
     )
     runner = FakeRunner(
         {
@@ -599,11 +595,7 @@ def test_cli_parse_failure_exit_code():
 def test_cli_empty_partition_scope_is_a_no_match():
     partition = "missing"
     sinfo_command = (*SINFO_COMMAND, "-p", partition)
-    sacct_command = _sacct_command(
-        SACCT_COMMAND,
-        states=("RUNNING",),
-        partitions=(partition,),
-    )
+    sacct_command = SACCT_COMMAND
     runner = FakeRunner(
         {
             sinfo_command: make_result(sinfo_command, ""),
@@ -1565,22 +1557,19 @@ def test_cli_rejects_removed_options(argv):
     assert excinfo.value.code == 2
 
 
-def test_sacct_command_removes_state_and_keeps_scope_filters():
+def test_sacct_command_removes_state_and_keeps_user_filter():
     command = ("sacct", "-a", "-s", "RUNNING", "-P")
 
     assert _sacct_command(
         command,
         states=None,
         users={"alice"},
-        partitions=("gpu", "monakhova"),
     ) == (
         "sacct",
         "-a",
         "-P",
         "--user",
         "alice",
-        "--partition",
-        "gpu,monakhova",
     )
 
 
@@ -2077,7 +2066,6 @@ def test_cli_jobs_mode_filters_partition_and_active_states():
         JOBS_SACCT_COMMAND,
         states=None,
         users={"alice"},
-        partitions=("monakhova",),
     )
     runner = FakeRunner(
         {
@@ -2113,18 +2101,33 @@ def test_cli_partition_short_flag_parses_multiple_values():
     assert args.partition == ["monakhova", "gpu"]
 
 
-def test_cli_jobs_mode_partition_filter_does_not_infer_from_scoped_node():
+@pytest.mark.parametrize(
+    ("user_args", "users", "expected_ids"),
+    [
+        ([], set(), {"101", "103", "104", "105", "107"}),
+        (["--me"], {"alice"}, {"101", "105", "107"}),
+        (["--users", "bob"], {"bob"}, {"103", "104"}),
+    ],
+)
+def test_cli_jobs_partition_scope_includes_all_usage_on_nodes(
+    user_args, users, expected_ids
+):
     sacct_output = "\n".join(
         [
-            "alice|101|run_a|RUNNING|gpu|monakhova-compute-01|billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
+            "alice|101|run_a|RUNNING|monakhova|monakhova-compute-01|billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
             "alice|102|run_b|RUNNING|gpu|other-node|billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
+            "bob|103|interactive|RUNNING|monakhova-interactive|monakhova-compute-01|cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
+            "bob|104|shared|RUNNING|gpu|monakhova-compute-01|cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
+            "alice|105|pending_here|PENDING|monakhova|None assigned||7-00:00:00|",
+            "alice|106|pending_elsewhere|PENDING|gpu|None assigned||7-00:00:00|",
+            "alice|107|shared|RUNNING|gpu|monakhova-compute-01|cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
+            "bob|108|done|COMPLETED|monakhova-interactive|monakhova-compute-01|cpu=8,gres/gpu=1,mem=32G,node=1|7-00:00:00|",
         ]
     )
     jobs_command = _sacct_command(
         JOBS_SACCT_COMMAND,
         states=None,
-        users={"alice"},
-        partitions=("monakhova",),
+        users=users,
     )
     runner = FakeRunner(
         {
@@ -2135,19 +2138,19 @@ def test_cli_jobs_mode_partition_filter_does_not_infer_from_scoped_node():
             ),
         }
     )
-    stream = io.StringIO()
-    console = Console(file=stream, width=180, force_terminal=False)
+    stdout = RecordingConsole()
 
-    code = cli_main(
-        ["--jobs", "--users", "alice", "--partition", "monakhova"],
-        runner=runner,
-        console=console,
-        stderr_console=RecordingConsole(),
-    )
+    with patch("gtop.cli.getpass.getuser", return_value="alice"):
+        code = cli_main(
+            ["-j", "--json", "-p", "monakhova", *user_args],
+            runner=runner,
+            console=stdout,
+            stderr_console=RecordingConsole(),
+        )
 
-    output = stream.getvalue()
-    assert code == EXIT_NO_MATCHES
-    assert "No jobs found matching the criteria." in output
+    assert code == EXIT_SUCCESS
+    payload = json.loads(stdout.calls[0][0][0])
+    assert {job["job_id"] for job in payload["jobs"]} == expected_ids
 
 
 def test_cli_jobs_mode_flattens_comma_separated_partitions():
@@ -2162,7 +2165,6 @@ def test_cli_jobs_mode_flattens_comma_separated_partitions():
         JOBS_SACCT_COMMAND,
         states=None,
         users={"alice"},
-        partitions=("monakhova", "scavenge"),
     )
     runner = FakeRunner(
         {
@@ -2205,7 +2207,6 @@ def test_cli_jobs_mode_partition_filter_avoids_node_substring_false_positive():
         JOBS_SACCT_COMMAND,
         states=None,
         users={"alice"},
-        partitions=("gpu",),
     )
     runner = FakeRunner(
         {
@@ -2359,7 +2360,6 @@ def test_cli_jobs_partition_scope_matches_pending_partition_choices():
         JOBS_SACCT_COMMAND,
         states=None,
         users={"alice"},
-        partitions=("gpu",),
     )
     scoped_sinfo = (*SINFO_COMMAND, "-p", "gpu")
     runner = FakeRunner(

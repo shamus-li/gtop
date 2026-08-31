@@ -70,7 +70,12 @@ gtop -s
 gtop --json
 ```
 
-`-p` accepts one or more partitions. `-C` requires every listed node feature.
+`-p` selects nodes in one or more partitions and includes all usage on those
+nodes, even from jobs submitted through other partitions. For example,
+`gtop -j -p monakhova` also shows jobs on those nodes from
+`monakhova-interactive` or `gpu`. Pending jobs without assigned nodes are
+filtered by their requested partitions. Add `-m` to limit usage to your jobs.
+`-C` requires every listed node feature.
 `-s` switches capacity and top-user views to shard counts. `--json` emits a
 compact, view-specific schema.
 
