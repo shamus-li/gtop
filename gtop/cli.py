@@ -409,7 +409,7 @@ def cli_main(
         for renderable in job_view.renderables:
             active_console.print(
                 renderable,
-                soft_wrap=isinstance(renderable, Text),
+                soft_wrap=True,
             )
         return EXIT_SUCCESS
 

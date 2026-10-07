@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Collection, Mapping, Optional, Sequence
 
-from rich.console import Group
+from rich.cells import cell_len
+from rich.console import (
+    Console,
+    ConsoleOptions,
+    Group,
+    JustifyMethod,
+    RenderResult,
+)
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
@@ -211,7 +219,110 @@ def _capacity_value(group: _JobGroup) -> Text:
     return value
 
 
-def _capacity_table(groups: Sequence[_JobGroup], *, width: Optional[int]) -> Table:
+@dataclass(frozen=True)
+class _PlainTable:
+    """Lays out rows like a borderless rich Table without per-cell rendering.
+
+    A cell is a ``(value, style)`` pair, which wraps when its column collapses,
+    or a multi-style ``Text`` in a column that never collapses.
+    """
+
+    headers: Sequence[str]
+    rows: Sequence[Sequence[Text | tuple[str, str]]]
+    right: Collection[str] = ()
+    wrap: Collection[str] = ()
+    min_widths: Mapping[str, int] = field(default_factory=dict)
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        max_width = options.max_width
+        rows = [[(header, "bold white") for header in self.headers], *self.rows]
+        last = len(self.headers) - 1
+        pads = [int(index < last) for index in range(len(self.headers))]
+        minimums = [
+            self.min_widths.get(header, len(header)) + pad
+            for header, pad in zip(self.headers, pads)
+        ]
+        widths = [
+            max(
+                min(max(_cell_width(row[index]) for row in rows) + pad, max_width),
+                minimum,
+            )
+            for index, (pad, minimum) in enumerate(zip(pads, minimums))
+        ]
+        if sum(widths) > max_width:
+            # Shrink wrappable columns the same way rich's Table does.
+            widths = [
+                max(width, minimum)
+                for width, minimum in zip(
+                    Table._collapse_widths(
+                        widths,
+                        [header in self.wrap for header in self.headers],
+                        max_width,
+                    ),
+                    minimums,
+                )
+            ]
+
+        for row_index, row in enumerate(rows):
+            cells = [
+                _cell_lines(
+                    console,
+                    cell,
+                    width=width - pad,
+                    justify="right" if header in self.right else "left",
+                )
+                for cell, header, width, pad in zip(row, self.headers, widths, pads)
+            ]
+            # rich styles header padding with the header style.
+            pad_style = console.get_style("bold white") if row_index == 0 else None
+            for line_index in range(max(len(lines) for lines in cells)):
+                for lines, width, pad in zip(cells, widths, pads):
+                    if line_index < len(lines):
+                        yield from lines[line_index]
+                    else:
+                        yield Segment(" " * (width - pad))
+                    if pad:
+                        yield Segment(" " * pad, pad_style)
+                yield Segment.line()
+
+
+def _cell_width(cell: Text | tuple[str, str]) -> int:
+    return cell.cell_len if isinstance(cell, Text) else cell_len(cell[0])
+
+
+def _cell_lines(
+    console: Console,
+    cell: Text | tuple[str, str],
+    *,
+    width: int,
+    justify: JustifyMethod,
+) -> list[list[Segment]]:
+    if isinstance(cell, Text):
+        style = console.get_style(cell.style)
+        padding = Segment(" " * (width - cell.cell_len), style)
+        segments = list(Segment.apply_style(cell.render(console), style))
+        return [[padding, *segments] if justify == "right" else [*segments, padding]]
+    value, style_name = cell
+    style = console.get_style(style_name)
+    value_width = cell_len(value)
+    if value_width > width:
+        return [
+            [Segment(line.plain, style)]
+            for line in Text(value).wrap(
+                console, width, justify=justify, overflow="fold"
+            )
+        ]
+    padding = " " * (width - value_width)
+    return [
+        [Segment(padding + value if justify == "right" else value + padding, style)]
+    ]
+
+
+def _capacity_table(
+    groups: Sequence[_JobGroup], *, width: Optional[int]
+) -> Table | _PlainTable:
     capacities = [_capacity_value(group) for group in groups]
     job_labels = [
         f"{len(group.jobs)} {_pluralize(len(group.jobs), 'job')}" for group in groups
@@ -245,18 +356,17 @@ def _capacity_table(groups: Sequence[_JobGroup], *, width: Optional[int]) -> Tab
             table.add_row(card)
         return table
 
-    table = _data_table(show_header=True)
-    for label in ("Node", "GPU Type", "Capacity"):
-        table.add_column(label, header_style="bold white", no_wrap=True)
+    headers = ["Node", "GPU Type", "Capacity"]
     if include_bar:
-        table.add_column("Usage", header_style="bold white", no_wrap=True)
+        headers.append("Usage")
     if include_split:
-        table.add_column("Partitions", header_style="bold white", no_wrap=True)
-    table.add_column("Jobs", header_style="bold white", no_wrap=True)
+        headers.append("Partitions")
+    headers.append("Jobs")
+    rows = []
     for group, capacity, jobs_label in zip(groups, capacities, job_labels):
-        row: list[Text] = [
-            Text(group.assignment, style="bold cyan"),
-            Text(group.gpu_type, style="white"),
+        row: list[Text | tuple[str, str]] = [
+            (group.assignment, "bold cyan"),
+            (group.gpu_type, "white"),
             capacity,
         ]
         if include_bar:
@@ -269,9 +379,9 @@ def _capacity_table(groups: Sequence[_JobGroup], *, width: Optional[int]) -> Tab
             )
         if include_split:
             row.append(_build_split(group.partitions))
-        row.append(Text(jobs_label, style="white"))
-        table.add_row(*row)
-    return table
+        row.append((jobs_label, "white"))
+        rows.append(row)
+    return _PlainTable(headers, rows)
 
 
 _DETAIL_HEADERS = (
@@ -319,32 +429,39 @@ def _job_rows(
     return rows
 
 
-def _job_cards(rows: Sequence[tuple[str, ...]]) -> Text:
-    cards = Text()
-    for row_index, row in enumerate(rows):
-        if row_index:
-            cards.append("\n\n")
-        values = dict(zip(_DETAIL_HEADERS, row))
-        for label in ("ID", "Node", "Partition", "State", "User", "Time", "Name"):
-            if label != "ID":
-                cards.append("\n")
-            cards.append(f"{label}: ", style="bold white")
-            style = {
-                "ID": "bright_black",
-                "Partition": _partition_color(values[label]),
-                "State": _job_state_style(values[label]),
-                "User": "cyan",
-            }.get(label, "white")
-            cards.append(values[label], style=style)
-        cards.append("\nGPU/CPU/MEM: ", style="bold white")
-        cards.append(
-            "/".join(values[label] for label in ("GPU", "CPU", "MEM")),
-            style="white",
-        )
-    return cards
+@dataclass(frozen=True)
+class _JobCards:
+    rows: Sequence[tuple[str, ...]]
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        label_style = console.get_style("bold white")
+        white = console.get_style("white")
+        for row_index, row in enumerate(self.rows):
+            if row_index:
+                yield Segment.line()
+            values = dict(zip(_DETAIL_HEADERS, row))
+            for label in ("ID", "Node", "Partition", "State", "User", "Time", "Name"):
+                style = {
+                    "ID": "bright_black",
+                    "Partition": _partition_color(values[label]),
+                    "State": _job_state_style(values[label]),
+                    "User": "cyan",
+                }.get(label, "white")
+                yield Segment(f"{label}: ", label_style)
+                yield Segment(values[label], console.get_style(style))
+                yield Segment.line()
+            yield Segment("GPU/CPU/MEM: ", label_style)
+            yield Segment(
+                "/".join(values[label] for label in ("GPU", "CPU", "MEM")), white
+            )
+            yield Segment.line()
 
 
-def _job_details(rows: Sequence[tuple[str, ...]], *, width: Optional[int]) -> Any:
+def _job_details(
+    rows: Sequence[tuple[str, ...]], *, width: Optional[int]
+) -> _JobCards | _PlainTable:
     show_node = len({row[1] for row in rows}) > 1
     headers = [
         header for header in _DETAIL_HEADERS if show_node or header != "Node"
@@ -354,34 +471,28 @@ def _job_details(rows: Sequence[tuple[str, ...]], *, width: Optional[int]) -> An
         for header in headers
     ]
     if not _fits_width(width, minimum_widths):
-        return _job_cards(rows)
+        return _JobCards(rows)
 
-    table = _data_table(show_header=True)
-    for label in headers:
-        wraps = label not in {"State", "GPU", "CPU", "MEM"}
-        table.add_column(
-            label,
-            header_style="bold white",
-            justify="right" if label in {"GPU", "CPU", "MEM", "Time"} else "left",
-            no_wrap=not wraps,
-            overflow="fold" if wraps else "ellipsis",
-            min_width=12 if label == "Name" else len(label),
-        )
+    styled_rows = []
     for row in rows:
         cells = [
-            Text(row[0], style="dim"),
-            Text(row[1], style="cyan"),
-            Text(row[2], style=_job_state_style(row[2])),
-            Text(row[3], style="cyan"),
-            Text(row[4], style=_partition_color(row[4])),
-            *(Text(value, style="white") for value in row[5:8]),
-            Text(row[8], style="white"),
-            Text(row[9], style="white"),
+            (row[0], "dim"),
+            (row[1], "cyan"),
+            (row[2], _job_state_style(row[2])),
+            (row[3], "cyan"),
+            (row[4], _partition_color(row[4])),
+            *((value, "white") for value in row[5:]),
         ]
         if not show_node:
             cells.pop(1)
-        table.add_row(*cells)
-    return table
+        styled_rows.append(cells)
+    return _PlainTable(
+        headers,
+        styled_rows,
+        right={"GPU", "CPU", "MEM", "Time"},
+        wrap={"ID", "Node", "User", "Partition", "Time", "Name"},
+        min_widths={"Name": 12},
+    )
 
 
 def render_jobs_view(
