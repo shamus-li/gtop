@@ -186,11 +186,10 @@ def parse_cpu(cpu_state: str) -> CpuInfo:
     parts = cpu_state.split("/")
     if len(parts) != 4 or any(not part.isdigit() for part in parts):
         raise ValueError(f"Invalid CPU state '{cpu_state}'")
-    idle = int(parts[1])
-    total = int(parts[3])
-    if idle > total:
-        raise ValueError(f"CPU idle count {idle} exceeds total {total}")
-    return CpuInfo(idle=idle, total=total)
+    allocated, idle, other, total = (int(part) for part in parts)
+    if allocated + idle + other > total:
+        raise ValueError(f"CPU state '{cpu_state}' exceeds total {total}")
+    return CpuInfo(idle=idle, total=total, other=other)
 
 
 def _parse_numeric(value: str) -> float:

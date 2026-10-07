@@ -64,8 +64,7 @@ def test_shard_used_tracking():
 
     assert result.used == 1
     assert result.used_shards == 100
-    assert result.occupied(show_shards=False) == 2
-    assert result.occupied(show_shards=True) == 300
+    assert result.occupied() == 2
 
 
 def test_explicit_shards_contribute_to_physical_gpu_occupancy():
@@ -74,8 +73,7 @@ def test_explicit_shards_contribute_to_physical_gpu_occupancy():
 
     result = parse_gpu(gres, gres_used)
 
-    assert result.occupied(show_shards=False) == 1
-    assert result.occupied(show_shards=True) == 100
+    assert result.occupied() == 1
 
 
 def test_generic_shards_and_per_device_occupancy():
@@ -87,7 +85,7 @@ def test_generic_shards_and_per_device_occupancy():
     assert result.num == 2
     assert result.shards == 200
     assert result.shard_gpus_used == 2
-    assert result.occupied(show_shards=False) == 2
+    assert result.occupied() == 2
 
 
 def test_multiple_shard_capacities_are_summed():

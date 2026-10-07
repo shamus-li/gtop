@@ -7,7 +7,8 @@
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
 - A login node where `sinfo` and `sacct` can read the cluster state
 
-The parser is tested against captured Cornell Unicorn and Empire AI Slurm output.
+gtop is built for the Cornell Unicorn cluster, where partitions have priority
+tiers and nodes carry `gpu-high`, `gpu-mid` or `gpu-low` features.
 
 ## Install
 
@@ -30,54 +31,45 @@ The binary is installed in `$(uv tool dir --bin)` (usually `~/.local/bin`).
 gtop
 ```
 
-The default view groups free capacity by GPU family. `--nodes` expands those
-groups into nodes, `--jobs` shows active jobs, and `-U` shows the top 25 users.
+For each partition you can submit to: GPUs free now, and how many more you
+would get by preempting jobs in lower-priority partitions. A node's GPUs count
+as free when one job could take them plus 4 CPUs and 16G RAM on that node;
+idle GPUs on nodes without that much CPU or RAM are listed as short. Use
+`-t high`, `-t mid` or `-t low` to show only one GPU tier, and `-C` to require
+node features: `gtop -C nvlink 'ampere|ada|hopper|blackwell'` shows modern GPUs
+with NVLink. `gtop nodes` takes the same filters.
 
 ```bash
-gtop -v
-gtop --nodes
+gtop nodes
+gtop nodes nikola-compute-14
 ```
 
-Show the node-by-node view.
+Free GPU, CPU and memory on every node. Name one or more nodes to see their
+state (with any drain reason), the partitions that include them, the jobs
+running there and the jobs queued for them. Jobs queued in the node's lab
+partitions are listed; shared queues such as `gpu` are only counted.
 
 ```bash
-gtop -m
-gtop -u wl757
-gtop -u wl757 abc123
-gtop -m -v
+gtop users
+gtop users --week
+gtop users --month
+gtop users --year
 ```
 
-Filter to your own usage or one or more users. Use `-j -m` to see your jobs.
+Who is using GPUs now, or GPU-hours per user and lab account over the last 7,
+30 or 365 days, from `sreport`. Results are cached. The week and month caches
+refresh in the background (hourly and every 6 hours); the year cache only
+updates when you add `--refresh`, which takes about 80 seconds.
 
 ```bash
-gtop -U
+gtop jobs
+gtop jobs -m
 ```
 
-Show the top 25 users.
+Running, pending and requeued jobs.
 
-```bash
-gtop -j
-gtop -j -m
-gtop -j -p monakhova
-```
-
-Jobs always include running, pending, and requeued records.
-
-```bash
-gtop -p monakhova gpu
-gtop -C gpu gpu-high
-gtop -s
-gtop --json
-```
-
-`-p` selects nodes in one or more partitions and includes all usage on those
-nodes, even from jobs submitted through other partitions. For example,
-`gtop -j -p monakhova` also shows jobs on those nodes from
-`monakhova-interactive` or `gpu`. Pending jobs without assigned nodes are
-filtered by their requested partitions. Add `-m` to limit usage to your jobs.
-`-C` requires every listed node feature.
-`-s` switches capacity and top-user views to shard counts. `--json` emits a
-compact, view-specific schema.
+Every command takes `-p PARTITION` and `--json`; `nodes`, `users` and `jobs`
+also take `-m` (your usage) or `-u USER`.
 
 ## Help
 

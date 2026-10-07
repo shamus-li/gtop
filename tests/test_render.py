@@ -80,7 +80,8 @@ def test_canonical_palette_and_legend_are_shared_by_help():
     bar = _build_bar(
         {"priority": 1, "gpu": 1, "default": 1, "other": 1},
         free=0,
-        width=4,
+        unavailable=1,
+        width=5,
     )
 
     assert SEMANTIC_PALETTE == {
@@ -164,7 +165,6 @@ def test_filtered_bar_only_shows_selected_usage():
         "gpu": _resource_numbers(
             server,
             "gpu",
-            show_shards=False,
             show_used=True,
         )
     }
@@ -380,3 +380,33 @@ def test_job_header_converts_each_sharded_node_at_its_own_rate():
     console.print(render_jobs_view([job], servers=servers, width=120))
 
     assert "300/600 shards used" in stream.getvalue()
+
+
+def test_free_gpus_need_4_cpus_and_16g_ram_on_the_node():
+    from gtop.render_ready import build_availability
+    from gtop.scheduling import parse_partitions
+    from gtop.slurm import parse_sinfo
+
+    servers = parse_sinfo(
+        "\n".join(
+            [
+                # One job can take all 6 GPUs with 4 CPUs and 16G.
+                "roomy|gpu-high|gpu:a100:6(S:0)|gpu:a100:0(IDX:N/A)|60/4/0/64|495616|512000",
+                # Idle GPUs, but only 3 CPUs free.
+                "cpu-bound|gpu-high|gpu:a100:2(S:0)|gpu:a100:0(IDX:N/A)|61/3/0/64|0|512000",
+                # Idle GPUs, but only 10G RAM free.
+                "mem-bound|gpu-high|gpu:h100:4(S:0)|gpu:h100:0(IDX:N/A)|0/64/0/64|501760|512000",
+            ]
+        )
+    )
+    partitions = parse_partitions(
+        "PartitionName=gpu AllowGroups=ALL PriorityTier=5 "
+        "Nodes=roomy,cpu-bound,mem-bound"
+    )
+
+    (result,) = build_availability(servers, partitions, [partitions["gpu"]])
+
+    assert {row.gpu_type: (row.free, row.short) for row in result.rows} == {
+        "A100": (6, 2),
+        "H100": (0, 4),
+    }

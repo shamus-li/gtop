@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Collection, Dict, List, Optional
+from typing import Collection, Dict, List, Optional, Set
 
-from .constants import SINFO_FIELD_WIDTHS
+from .constants import (
+    SACCT_DELIMITER,
+    SACCT_FIELD_COUNT,
+    SINFO_FIELD_WIDTHS,
+    STALE_RUNNING_GRACE_SECONDS,
+)
 from .constraints import requested_constraint_features
 from .models import JobRecord, ServerState
 from .resources import parse_cpu, parse_gpu, parse_mem, parse_usage
@@ -93,16 +98,6 @@ def parse_features_field(features: str) -> set[str]:
     return set(parsed)
 
 
-def _split_job_line(line: str) -> Optional[List[str]]:
-    if not line:
-        return None
-    if "|" in line:
-        parts = [segment.strip() for segment in line.split("|")]
-    else:
-        parts = line.split()
-    return parts if len(parts) >= 6 else None
-
-
 def _canonical_job_state(state: str) -> str:
     words = state.split(maxsplit=1)
     return words[0].removesuffix("+") if words else ""
@@ -125,60 +120,60 @@ def _valid_job_fields(
     )
 
 
+def _duration_seconds(value: str) -> Optional[int]:
+    days, _, clock = value.rpartition("-")
+    fields = clock.split(":")
+    if days and not days.isdigit():
+        return None
+    if len(fields) > 3 or not all(field.isdigit() for field in fields):
+        return None
+    hours, minutes, seconds = [0] * (3 - len(fields)) + [int(field) for field in fields]
+    return int(days or 0) * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _outlived_time_limit(elapsed: str, time_limit: str) -> bool:
+    elapsed_seconds = _duration_seconds(elapsed)
+    limit_seconds = _duration_seconds(time_limit)
+    if elapsed_seconds is None or limit_seconds is None:
+        return False
+    return elapsed_seconds > limit_seconds + STALE_RUNNING_GRACE_SECONDS
+
+
 def parse_jobs(
     output: str,
     *,
     states: Optional[Collection[str]] = None,
 ) -> List[JobRecord]:
     jobs: List[JobRecord] = []
-    if not output.strip():
-        return jobs
-
-    for line_number, line in enumerate(output.strip().splitlines(), start=1):
-        stripped_line = line.strip()
-        if states is not None and "|" in stripped_line:
-            state_fields = stripped_line.split("|", 4)
-            if len(state_fields) >= 4:
-                state = _canonical_job_state(state_fields[3])
-                state_code = state.replace("_", "")
-                if (
-                    state_code.isalpha()
-                    and state_code.isupper()
-                    and state not in states
-                ):
-                    continue
-
-        parts = _split_job_line(stripped_line)
-        if not parts:
+    for line_number, line in enumerate(output.splitlines(), start=1):
+        if not line.strip():
+            continue
+        fields = [field.strip() for field in line.split(SACCT_DELIMITER)]
+        if len(fields) != SACCT_FIELD_COUNT:
             raise ValueError(f"Malformed sacct record on line {line_number}")
-        if len(parts) >= 10 and parts[-1] == "" and (not parts[-3] or "=" in parts[-3]):
-            parts.pop()
-        has_constraints_column = len(parts) >= 9 and (not parts[-2] or "=" in parts[-2])
-        if has_constraints_column:
-            user, job_id, job_name, state, partition, nodelist = parts[:6]
-            constraints_str = "|".join(parts[6:-2])
-            usage_str, time_limit = parts[-2:]
-        elif len(parts) >= 8:
-            (
-                user,
-                job_id,
-                job_name,
-                state,
-                partition,
-                nodelist,
-                usage_str,
-                time_limit,
-            ) = parts[:8]
-            constraints_str = ""
-        else:
-            user, partition, nodelist, state, usage_str, job_id = parts[:6]
-            job_name = ""
-            time_limit = ""
+        (
+            user,
+            job_id,
+            job_name,
+            state,
+            partition,
+            nodelist,
+            constraints_str,
+            usage_str,
+            time_limit,
+            elapsed,
+            requested_str,
+            reason,
+        ) = fields
+        if constraints_str == "(null)":  # squeue's empty Feature
             constraints_str = ""
         state = _canonical_job_state(state)
+        usage_str = usage_str or requested_str
         if not _valid_job_fields(user, job_id, state, usage_str):
             raise ValueError(f"Malformed sacct record on line {line_number}")
         if states is not None and state not in states:
+            continue
+        if state == "RUNNING" and _outlived_time_limit(elapsed, time_limit):
             continue
         try:
             usage = parse_usage(usage_str)
@@ -196,6 +191,8 @@ def parse_jobs(
                 nodelist=nodelist,
                 usage=usage,
                 time_limit=time_limit,
+                elapsed=elapsed,
+                reason="" if reason == "None" else reason,
                 constraints=requested_constraint_features(constraints_str),
             )
         )
@@ -220,10 +217,13 @@ def _split_sinfo_line(line: str) -> Optional[List[str]]:
 
 def parse_sinfo(output: str) -> Dict[str, ServerState]:
     servers: Dict[str, ServerState] = {}
+    # sinfo -N repeats each node once per partition with identical fields.
+    seen_lines: Set[str] = set()
     for line_number, raw_line in enumerate(output.strip().splitlines(), start=1):
         line = raw_line.rstrip("\n")
-        if not line.strip():
+        if not line.strip() or line in seen_lines:
             continue
+        seen_lines.add(line)
 
         parts = _split_sinfo_line(line)
         if not parts:

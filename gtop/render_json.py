@@ -15,11 +15,13 @@ def _capacity(
     total: float,
     used: float,
     unit: str,
+    unavailable: float = 0.0,
 ) -> dict[str, int | float | str]:
     return {
         "total": _number(total),
         "used": _number(used),
-        "free": _number(max(total - used, 0)),
+        "free": _number(max(total - used - unavailable, 0)),
+        "unavailable": _number(unavailable),
         "unit": unit,
     }
 
@@ -32,13 +34,8 @@ def _partitions(values: dict[str, float]) -> dict[str, int | float]:
     }
 
 
-def summary_json(
-    servers: Sequence[ServerState],
-    *,
-    show_shards: bool,
-    show_used: bool = False,
-) -> dict[str, Any]:
-    unit = "shard" if show_shards else "GPU"
+def summary_json(servers: Sequence[ServerState]) -> dict[str, Any]:
+    unit = "GPU"
     grouped: dict[str, list[ServerState]] = {}
     for server in servers:
         grouped.setdefault(_display_gpu_type(server), []).append(server)
@@ -47,24 +44,15 @@ def summary_json(
     total_capacity = 0
     total_used = 0.0
     for gpu_type, grouped_servers in sorted(grouped.items()):
-        total = sum(server.gpu.capacity(show_shards) for server in grouped_servers)
+        total = sum(server.gpu.num for server in grouped_servers)
         partition_totals: dict[str, float] = {}
         for server in grouped_servers:
-            usage = (
-                server.usage["shard"]
-                if show_shards and server.gpu.shards > 0
-                else server.usage["gpu"]
-            )
-            for partition, amount in usage.partitions.items():
+            for partition, amount in server.usage["gpu"].partitions.items():
                 partition_totals[partition] = (
                     partition_totals.get(partition, 0.0) + amount
                 )
-        used = (
-            sum(partition_totals.values())
-            if show_used
-            else sum(server.gpu.occupied(show_shards) for server in grouped_servers)
-        )
-        if show_used and used <= 0:
+        used = sum(partition_totals.values())
+        if used <= 0:
             continue
         total_capacity += total
         total_used += used
@@ -88,18 +76,10 @@ def summary_json(
     }
 
 
-def nodes_json(
-    servers: Sequence[ServerState],
-    *,
-    show_shards: bool,
-) -> dict[str, Any]:
+def nodes_json(servers: Sequence[ServerState]) -> dict[str, Any]:
     nodes = []
     for server in servers:
-        gpu_usage = (
-            server.usage["shard"]
-            if show_shards and server.gpu.shards > 0
-            else server.usage["gpu"]
-        )
+        gpu_usage = server.usage["gpu"]
         partition_names = set(gpu_usage.partitions)
         partition_names.update(server.usage["cpu"].partitions)
         partition_names.update(server.usage["mem"].partitions)
@@ -119,20 +99,27 @@ def nodes_json(
             {
                 "name": server.name,
                 "gpu_type": _display_gpu_type(server),
+                "accepts_jobs": server.accepts_jobs,
                 "gpu": _capacity(
-                    total=server.gpu.capacity(show_shards),
-                    used=server.gpu.occupied(show_shards),
-                    unit="shard" if show_shards else "GPU",
+                    total=server.gpu.num,
+                    used=server.gpu.occupied(),
+                    unit="GPU",
+                    unavailable=0
+                    if server.accepts_jobs
+                    else server.gpu.num - server.gpu.occupied(),
                 ),
                 "cpu": _capacity(
                     total=server.cpu.total,
-                    used=server.cpu.total - server.cpu.idle,
+                    used=server.cpu.total - server.cpu.idle - server.cpu.other,
                     unit="CPU",
+                    unavailable=server.cpu.other
+                    + (0 if server.accepts_jobs else server.cpu.idle),
                 ),
                 "memory": _capacity(
                     total=server.mem.total / 1024,
                     used=(server.mem.total - server.mem.idle) / 1024,
                     unit="GiB",
+                    unavailable=0 if server.accepts_jobs else server.mem.idle / 1024,
                 ),
                 "usage": {"partitions": partitions},
             }

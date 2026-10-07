@@ -25,6 +25,8 @@ class FixtureRunner:
         self.responses = responses
 
     def run(self, command: Command, timeout: int) -> CommandResult:
+        if command not in self.responses and "squeue" in command:
+            return CommandResult(command, "", "", 0)
         return self.responses[command]
 
 
@@ -92,47 +94,25 @@ def test_empire_fixed_width_sinfo_layout_parses():
     assert server.mem.total == 1907348
 
 
-def test_empire_summary_and_json_report_gpu_nodes_only():
+def test_empire_nodes_report_gpu_nodes_only():
     stream = io.StringIO()
     code = cli_main(
-        [],
+        ["nodes", "-t", "all"],
         runner=_runner(),
         console=Console(file=stream, width=140, force_terminal=False),
         stderr_console=Console(file=io.StringIO(), force_terminal=False),
     )
 
     assert code == EXIT_SUCCESS
-    assert "Cluster Overview  9/17 GPUs free" in stream.getvalue()
+    # alphagh01 reports every CPU as "other" (down), so its GPU is not free.
+    assert "Cluster Overview  8/17 GPUs free" in stream.getvalue()
     assert "H100 80GB HBM3" in stream.getvalue()
     assert "H200" in stream.getvalue()
-    assert "GPU" in stream.getvalue()
     assert "Null" not in stream.getvalue()
-
-    json_stream = io.StringIO()
-    json_code = cli_main(
-        ["--json"],
-        runner=_runner(),
-        console=Console(file=json_stream, width=140, force_terminal=False),
-        stderr_console=Console(file=io.StringIO(), force_terminal=False),
-    )
-    payload = json.loads(json_stream.getvalue())
-
-    assert json_code == EXIT_SUCCESS
-    assert payload["capacity"] == {
-        "free": 9,
-        "total": 17,
-        "unit": "GPU",
-        "used": 8,
-    }
-    assert [row["type"] for row in payload["gpu_types"]] == [
-        "GPU",
-        "H100 80GB HBM3",
-        "H200",
-    ]
 
     nodes_stream = io.StringIO()
     nodes_code = cli_main(
-        ["--nodes", "--json"],
+        ["nodes", "-t", "all", "--json"],
         runner=_runner(),
         console=Console(file=nodes_stream, width=140, force_terminal=False),
         stderr_console=Console(file=io.StringIO(), force_terminal=False),
@@ -151,7 +131,7 @@ def test_empire_jobs_exclude_assigned_cpu_nodes_but_keep_pending_jobs():
     stream = io.StringIO()
 
     code = cli_main(
-        ["--jobs"],
+        ["jobs"],
         runner=_runner(jobs_view=True),
         console=Console(file=stream, width=200, force_terminal=False),
         stderr_console=Console(file=io.StringIO(), force_terminal=False),
@@ -169,7 +149,7 @@ def test_empire_jobs_exclude_assigned_cpu_nodes_but_keep_pending_jobs():
 
     json_stream = io.StringIO()
     json_code = cli_main(
-        ["--jobs", "--json"],
+        ["jobs", "--json"],
         runner=_runner(jobs_view=True),
         console=Console(file=json_stream, width=200, force_terminal=False),
         stderr_console=Console(file=io.StringIO(), force_terminal=False),

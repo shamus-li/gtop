@@ -1,4 +1,4 @@
-user_a|672|gpu_training|RUNNING|rochester|alphagpu01||billing=192,cpu=96,gres/gpu:nvidia_h100_80gb_hbm3=8,gres/gpu=8,node=1|6-23:59:00
-user_b|665|gpu_pending|PENDING|rochester|None assigned|||6-23:59:00
-user_c|2761|multi_partition_pending|PENDING|suny,alpha|None assigned|||00:30:00
-user_d|2980|cpu_editor|RUNNING|cpu|alphacpu01||billing=4,cpu=4,node=1|18:00:00
+user_a672gpu_trainingRUNNINGrochesteralphagpu01billing=192,cpu=96,gres/gpu:nvidia_h100_80gb_hbm3=8,gres/gpu=8,node=16-23:59:0000:00:01
+user_b665gpu_pendingPENDINGrochesterNone assigned6-23:59:0000:00:01
+user_c2761multi_partition_pendingPENDINGsuny,alphaNone assigned00:30:0000:00:01
+user_d2980cpu_editorRUNNINGcpualphacpu01billing=4,cpu=4,node=118:00:0000:00:01

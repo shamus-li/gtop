@@ -22,18 +22,8 @@ class GpuInfo:
             return 0.0
         return self.shards / self.num
 
-    def capacity(self, show_shards: bool) -> int:
-        if show_shards and self.shards > 0:
-            return self.shards
-        return self.num
-
-    def occupied(self, show_shards: bool) -> int:
+    def occupied(self) -> int:
         shards_per_gpu = self.shards_per_gpu
-        if show_shards and self.shards > 0:
-            return min(
-                self.shards,
-                self.used_shards + int(round(self.used * shards_per_gpu)),
-            )
         shard_gpus = self.shard_gpus_used
         if shard_gpus <= 0 and self.used_shards > 0 and shards_per_gpu > 0:
             shard_gpus = math.ceil(self.used_shards / shards_per_gpu)
@@ -44,6 +34,7 @@ class GpuInfo:
 class CpuInfo:
     idle: int = 0
     total: int = 0
+    other: int = 0
 
 
 @dataclass
@@ -80,6 +71,8 @@ class JobRecord:
     nodelist: str
     usage: JobUsage
     time_limit: str
+    elapsed: str = ""
+    reason: str = ""
     constraints: frozenset[str] = frozenset()
 
 
@@ -102,6 +95,11 @@ class ServerState:
     mem: MemoryInfo
     usage: Dict[str, ResourceUsageSplit] = field(default_factory=_default_usage_splits)
     allocations: Dict[str, NodeAllocation] = field(default_factory=dict)
+
+    @property
+    def accepts_jobs(self) -> bool:
+        """sinfo reports CPUs on down or draining nodes as "other"."""
+        return self.cpu.other == 0
 
     def has_target_users(self, target_users: Set[str]) -> bool:
         return any(

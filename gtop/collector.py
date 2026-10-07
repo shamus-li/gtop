@@ -3,11 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from rich.text import Text
-
 from .accounting import process_jobs
 from .command_options import set_value_option
-from .constraints import compile_constraint
 from .constants import (
     ACTIVE_JOB_STATES,
     DEFAULT_TIMEOUT,
@@ -24,12 +21,11 @@ from .slurm import parse_jobs, parse_nodelist, parse_sinfo
 class CollectionOptions:
     sinfo_command: Command = SINFO_COMMAND
     sacct_command: Command = SACCT_COMMAND
+    # Live jobs from slurmctld, merged over sacct's records (squeue wins).
+    squeue_command: Optional[Command] = None
     timeout: int = DEFAULT_TIMEOUT
-    parallel: bool = True
     gpu_only: bool = False
     partition_filter: Optional[tuple[str, ...]] = None
-    constraint: Optional[str] = None
-    debug: bool = False
     store_allocations: bool = True
     allow_empty_servers: bool = False
 
@@ -71,10 +67,6 @@ def collect_cluster_state(
     stderr_console: Optional[Any] = None,
 ) -> ClusterState:
     active_options = options or CollectionOptions()
-    constraint = (
-        active_options.constraint.strip() if active_options.constraint else None
-    )
-    matches = compile_constraint(constraint) if constraint is not None else None
     scoped_sinfo_command = (
         _sinfo_command_for_partitions(
             active_options.sinfo_command, active_options.partition_filter
@@ -82,11 +74,13 @@ def collect_cluster_state(
         if active_options.partition_filter
         else active_options.sinfo_command
     )
+    commands = {"sinfo": scoped_sinfo_command, "sacct": active_options.sacct_command}
+    if active_options.squeue_command is not None:
+        commands["squeue"] = active_options.squeue_command
     results = run_commands(
-        {"sinfo": scoped_sinfo_command, "sacct": active_options.sacct_command},
+        commands,
         timeout=active_options.timeout,
         runner=runner,
-        parallel=active_options.parallel,
     )
 
     sinfo_result = results["sinfo"]
@@ -95,20 +89,9 @@ def collect_cluster_state(
         raise CommandExecutionError("sinfo", sinfo_result)
     if sacct_result.returncode != 0:
         raise CommandExecutionError("sacct", sacct_result)
-
-    if active_options.debug and stderr_console is not None:
-        stderr_console.print(
-            Text(
-                f"sinfo returned {len(sinfo_result.stdout.splitlines())} lines",
-                style="dim",
-            )
-        )
-        stderr_console.print(
-            Text(
-                f"sacct returned {len(sacct_result.stdout.splitlines())} lines",
-                style="dim",
-            )
-        )
+    squeue_result = results.get("squeue")
+    if squeue_result is not None and squeue_result.returncode != 0:
+        raise CommandExecutionError("squeue", squeue_result)
 
     try:
         servers = parse_sinfo(sinfo_result.stdout)
@@ -130,15 +113,6 @@ def collect_cluster_state(
         if not servers and not active_options.allow_empty_servers:
             raise NoMatchingServersError("No servers found matching the criteria.")
 
-    if matches is not None:
-        servers = {
-            name: info for name, info in servers.items() if matches(info.features)
-        }
-        if not servers and not active_options.allow_empty_servers:
-            raise NoMatchingServersError(
-                f"No servers found matching constraint '{constraint}'."
-            )
-
     try:
         active_jobs_by_id = {
             job.job_id: job
@@ -147,6 +121,11 @@ def collect_cluster_state(
                 states=ACTIVE_JOB_STATES,
             )
         }
+        if squeue_result is not None:
+            active_jobs_by_id.update(
+                (job.job_id, job)
+                for job in parse_jobs(squeue_result.stdout, states=ACTIVE_JOB_STATES)
+            )
     except ValueError as error:
         raise ClusterParseError(str(error)) from error
     jobs = list(active_jobs_by_id.values())
@@ -170,7 +149,6 @@ def collect_cluster_state(
         process_jobs(
             jobs,
             servers,
-            debug_enabled=active_options.debug,
             stderr_console=stderr_console,
             store_allocations=active_options.store_allocations,
         )

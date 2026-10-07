@@ -20,16 +20,10 @@ def make_server(
     )
 
 
-def render(server: ServerState, *, show_shards: bool) -> str:
+def render(server: ServerState) -> str:
     stream = io.StringIO()
     console = Console(file=stream, width=120, force_terminal=False)
-    console.print(
-        render_table(
-            [server],
-            show_shards=show_shards,
-            width=120,
-        )
-    )
+    console.print(render_table([server], width=120))
     return stream.getvalue()
 
 
@@ -40,10 +34,8 @@ def test_default_shows_gpu_count_not_shards():
 
     assert server.gpu.num == 2
     assert server.gpu.shards == 48
-    assert server.gpu.occupied(False) == 1
-    assert server.gpu.occupied(True) == 24
-    assert "1/2 GPU free" in render(server, show_shards=False)
-    assert "24/48 shards free" in render(server, show_shards=True)
+    assert server.gpu.occupied() == 1
+    assert "1/2 GPUs free" in render(server)
 
 
 def test_disp_shard_with_usage():
@@ -51,10 +43,8 @@ def test_disp_shard_with_usage():
     gres_used = "gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:100(0/200)"
     server = make_server(gres, gres_used)
 
-    assert server.gpu.occupied(False) == 2
-    assert server.gpu.occupied(True) == 300
-    assert "0/2 GPUs free" in render(server, show_shards=False)
-    assert "100/400 shards free" in render(server, show_shards=True)
+    assert server.gpu.occupied() == 2
+    assert "0/2 GPUs free" in render(server)
 
 
 def test_non_sharded_gpu_unchanged():
@@ -64,9 +54,8 @@ def test_non_sharded_gpu_unchanged():
 
     assert server.gpu.num == 8
     assert server.gpu.shards == 0
-    assert server.gpu.occupied(False) == 2
-    assert server.gpu.occupied(True) == 2
-    assert "6/8 GPUs free" in render(server, show_shards=False)
+    assert server.gpu.occupied() == 2
+    assert "6/8 GPUs free" in render(server)
 
 
 def test_regular_gpu_type_display():
@@ -82,7 +71,5 @@ def test_integration_default_vs_disp_shard():
     gres_used = "none"
     server = make_server(gres, gres_used)
 
-    assert server.gpu.capacity(False) == 2
-    assert server.gpu.capacity(True) == 400
-    assert server.gpu.occupied(False) == 0
-    assert server.gpu.occupied(True) == 0
+    assert server.gpu.num == 2
+    assert server.gpu.occupied() == 0

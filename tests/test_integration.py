@@ -3,35 +3,19 @@
 
 from pathlib import Path
 
-import pytest
 
 from gtop.constants import SACCT_COMMAND, SINFO_COMMAND, SINFO_FIELD_WIDTHS
 from gtop.accounting import process_jobs, summarize_users
-from gtop.constraints import compile_constraint
 from gtop.render_cluster import visible_servers
 from gtop.resources import parse_gpu
 from gtop.slurm import expand_range, parse_features_field, parse_jobs, parse_sinfo
+from sacct_rows import sacct_row
 
 FIXTURE_DIR = Path(__file__).resolve().parent
 
 
 def read_fixture(name: str) -> str:
     return (FIXTURE_DIR / name).read_text()
-
-
-def test_compile_constraint_matches_exact_features_with_and_semantics():
-    features = {"gpu", "gpu-high", "intel"}
-
-    assert compile_constraint("gpu")(features)
-    assert compile_constraint("gpu,gpu-high")(features)
-    assert not compile_constraint("amd")(features)
-    assert not compile_constraint("gpu-high,amd")(features)
-
-
-@pytest.mark.parametrize("constraint", ["", "gpu&gpu-high", "gpu|amd", "gpu*2"])
-def test_compile_constraint_rejects_non_feature_syntax(constraint):
-    with pytest.raises(ValueError):
-        compile_constraint(constraint)
 
 
 def test_klara_regular_gpu():
@@ -136,21 +120,6 @@ def test_parse_sinfo_g2_fixed_width():
     assert "gpu-high" in servers["badfellow"].features
 
 
-def test_constraint_filtering_with_fixture():
-    """Constraint expressions should narrow the server list as expected."""
-
-    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"))
-
-    matches_gpu_high = compile_constraint("gpu-high")
-    matching = [
-        name for name, info in servers.items() if matches_gpu_high(info.features)
-    ]
-
-    assert "sun-compute-01" in matching
-    assert "ma-compute-01" in matching
-    assert "g2-cpu-28" not in matching
-
-
 def test_process_jobs_applies_gpu_usage_split():
     """Processing sacct output should attribute GPU usage to nodes."""
 
@@ -220,22 +189,24 @@ def test_parse_sinfo_fixed_width_line():
     assert servers["demo-node"].mem.total == 65536
 
 
-def test_process_jobs_accepts_pipe_delimited_sacct_output():
+def test_process_jobs_counts_shard_jobs_as_gpu_occupancy():
     servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
-    pipe_output = (
-        "alice|default_partition|dutta-compute-01|RUNNING|"
-        "billing=8,cpu=8,gres/shard:nvidia_h100_nvl=12,gres/shard=12,mem=64G,node=1|12345|"
+    output = sacct_row(
+        "billing=8,cpu=8,gres/shard:nvidia_h100_nvl=12,gres/shard=12,mem=64G,node=1",
+        job_id="12345",
+        partition="default_partition",
+        nodelist="dutta-compute-01",
     )
 
-    process_jobs(parse_jobs(pipe_output), servers)
+    process_jobs(parse_jobs(output), servers)
 
     dutta = servers["dutta-compute-01"]
     assert dutta.usage["shard"].partitions == {"default_partition": 12}
-    assert dutta.usage["gpu"].partitions == {"default_partition": 0}
+    assert dutta.usage["gpu"].partitions == {"default_partition": 1}
 
 
 def test_parse_jobs_preserves_an_empty_time_limit_column():
-    jobs = parse_jobs("alice|123|train|RUNNING|gpu|node-a|gres/gpu=1|")
+    jobs = parse_jobs(sacct_row("gres/gpu=1", job_id="123", time_limit=""))
 
     assert jobs[0].job_id == "123"
     assert jobs[0].usage.gpu == 1
@@ -244,30 +215,26 @@ def test_parse_jobs_preserves_an_empty_time_limit_column():
 
 def test_parse_jobs_reads_constraints():
     jobs = parse_jobs(
-        "alice|123|train|PENDING|gpu|None assigned|gpu-high&ssd|gres/gpu=1|1:00:00|"
+        sacct_row(
+            "gres/gpu=1",
+            state="PENDING",
+            nodelist="None assigned",
+            constraints="gpu-high&ssd",
+        )
     )
 
     assert jobs[0].constraints == frozenset({"gpu-high", "ssd"})
 
 
-def test_parse_jobs_preserves_pipe_delimited_constraint_choices():
-    jobs = parse_jobs(
-        "alice|123|train|RUNNING|gpu|node-a|ampere|ada|hopper|gres/gpu=1|1:00:00"
-    )
-
-    assert jobs[0].constraints == frozenset({"ampere", "ada", "hopper"})
-    assert jobs[0].usage.gpu == 1
-    assert jobs[0].time_limit == "1:00:00"
-
-
 def test_process_jobs_converts_gpu_usage_to_shards_on_sharded_nodes():
     servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
-    pipe_output = (
-        "alice|gpu|dutta-compute-01|RUNNING|"
-        "billing=8,cpu=8,gres/gpu:nvidia_h100_nvl=2,gres/gpu=2,mem=64G,node=1|12345|"
+    jobs = parse_jobs(
+        sacct_row(
+            "billing=8,cpu=8,gres/gpu:nvidia_h100_nvl=2,gres/gpu=2,mem=64G,node=1",
+            job_id="12345",
+            nodelist="dutta-compute-01",
+        )
     )
-
-    jobs = parse_jobs(pipe_output)
     process_jobs(jobs, servers)
 
     dutta = servers["dutta-compute-01"]
@@ -293,9 +260,7 @@ def test_process_jobs_does_not_reallocate_filtered_nodes():
             ]
         ),
     )
-    jobs = parse_jobs(
-        "alice|1|train|RUNNING|gpu|node-[1-2]|cpu=8,gres/gpu=2,mem=32G|1:00:00|"
-    )
+    jobs = parse_jobs(sacct_row("cpu=8,gres/gpu=2,mem=32G", nodelist="node-[1-2]"))
 
     process_jobs(jobs, {"node-1": servers["node-1"]})
 
@@ -315,3 +280,23 @@ def test_sacct_command_requests_all_users():
 def test_expand_range_preserves_original_width():
     assert expand_range("1-3") == ["1", "2", "3"]
     assert expand_range("01-03") == ["01", "02", "03"]
+
+
+def test_stale_year_history_waits_for_refresh_but_week_refreshes(tmp_path, monkeypatch):
+    import json
+    from unittest.mock import patch
+
+    from gtop import history
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    stale = {"generated_at": 0.0, "gpu_hours": {"alice": 1.0}, "accounts": {}}
+    for window in ("week", "year"):
+        path = tmp_path / "gtop" / f"usage-{window}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(stale))
+
+    with patch.object(history, "_refresh_in_background") as refresh:
+        assert history.cached_history("year") is not None
+        refresh.assert_not_called()
+        assert history.cached_history("week") is not None
+        refresh.assert_called_once_with("week")

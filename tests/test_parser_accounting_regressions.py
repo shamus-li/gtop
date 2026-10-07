@@ -14,10 +14,11 @@ from gtop.collector import (
     CollectionOptions,
     collect_cluster_state,
 )
-from gtop.constants import SACCT_COMMAND, SINFO_COMMAND
+from gtop.constants import SACCT_COMMAND, SINFO_COMMAND, SQUEUE_COMMAND
 from gtop.resources import parse_gpu, parse_usage
 from gtop.runner import Command, CommandResult
 from gtop.slurm import parse_jobs, parse_nodelist, parse_sinfo
+from sacct_rows import sacct_row
 
 
 class FakeRunner:
@@ -32,19 +33,16 @@ def result(command: Command, stdout: str) -> CommandResult:
     return CommandResult(command=command, stdout=stdout, stderr="", returncode=0)
 
 
-def test_gpu_and_shard_requests_are_additive_in_both_units():
+def test_gpu_and_shard_requests_are_additive():
     servers = parse_sinfo(
         "node-1|gpu|gpu:a40:2,shard:a40:400|"
         "gpu:a40:1(IDX:0),shard:a40:40(0/200,40/200)|"
         "0/8/0/8|0|65536",
     )
-    jobs = parse_jobs(
-        "alice|1|mixed|RUNNING|gpu|node-1|cpu=1,gres/gpu=1,gres/shard=40|1:00:00|"
-    )
+    jobs = parse_jobs(sacct_row("cpu=1,gres/gpu=1,gres/shard=40", name="mixed"))
 
     process_jobs(jobs, servers)
     gpu_users = summarize_users(servers)
-    shard_users = summarize_users(servers, show_shards=True)
     projected = project_servers_for_users(
         list(servers.values()),
         target_users={"alice"},
@@ -53,7 +51,6 @@ def test_gpu_and_shard_requests_are_additive_in_both_units():
     assert servers["node-1"].allocations["1"].usage.shard == 240
     assert servers["node-1"].usage["shard"].partitions == {"gpu": 240}
     assert gpu_users["alice"].total_usage() == 2
-    assert shard_users["alice"].total_usage() == 240
     assert projected.usage["gpu"].partitions == {"gpu": 2}
     assert projected.usage["shard"].partitions == {"gpu": 240}
 
@@ -76,8 +73,8 @@ def test_parse_jobs_keeps_historical_rows_with_duplicate_job_ids():
     jobs = parse_jobs(
         "\n".join(
             [
-                "alice|639182|train|RESIZING|gpu|node-1|gres/gpu=1|1:00:00|",
-                "alice|639182|train|PREEMPTED|gpu|node-1|gres/gpu=1|1:00:00|",
+                sacct_row("gres/gpu=1", job_id="639182", state="RESIZING"),
+                sacct_row("gres/gpu=1", job_id="639182", state="PREEMPTED"),
             ]
         )
     )
@@ -96,8 +93,8 @@ def test_collector_deduplicates_active_jobs_last_record_wins():
                 SACCT_COMMAND,
                 "\n".join(
                     [
-                        "alice|1|first|RUNNING|gpu|node-1|gres/gpu=1|1:00:00|",
-                        "alice|1|last|RUNNING|gpu|node-1|gres/gpu=2|1:00:00|",
+                        sacct_row("gres/gpu=1", name="first"),
+                        sacct_row("gres/gpu=2", name="last"),
                     ]
                 ),
             ),
@@ -106,7 +103,7 @@ def test_collector_deduplicates_active_jobs_last_record_wins():
 
     state = collect_cluster_state(
         runner=runner,
-        options=CollectionOptions(parallel=False),
+        options=CollectionOptions(),
     )
 
     assert len(state.jobs) == 1
@@ -114,8 +111,55 @@ def test_collector_deduplicates_active_jobs_last_record_wins():
     assert state.servers["node-1"].usage["gpu"].partitions == {"gpu": 2}
 
 
+def test_collector_merges_squeue_jobs_over_sacct_records():
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: result(
+                SINFO_COMMAND,
+                "node-1|gpu|gpu:a100:4|gpu:a100:1(IDX:0)|0/8/0/8|0|65536",
+            ),
+            SACCT_COMMAND: result(
+                SACCT_COMMAND,
+                "\n".join(
+                    [
+                        sacct_row("gres/gpu=1", job_id="1"),
+                        sacct_row("gres/gpu=1", job_id="2_7", state="REQUEUED"),
+                        sacct_row("gres/gpu=1", job_id="9", user="bob"),
+                    ]
+                ),
+            ),
+            SQUEUE_COMMAND: result(
+                SQUEUE_COMMAND,
+                "\n".join(
+                    [
+                        sacct_row("gres/gpu=1", job_id="1", constraints="(null)"),
+                        sacct_row("gres/gpu=1", job_id="2_7", state="PENDING", nodelist=""),
+                        sacct_row(
+                            "gres/gpu=1", job_id="3_[1-4,9]", state="PENDING", nodelist=""
+                        ),
+                    ]
+                ),
+            ),
+        }
+    )
+
+    state = collect_cluster_state(
+        runner=runner,
+        options=CollectionOptions(squeue_command=SQUEUE_COMMAND),
+    )
+
+    assert {job.job_id: job.state for job in state.jobs} == {
+        "1": "RUNNING",
+        "2_7": "PENDING",
+        "9": "RUNNING",
+        "3_[1-4,9]": "PENDING",
+    }
+    assert all(not job.constraints for job in state.jobs)
+    assert state.servers["node-1"].usage["gpu"].partitions == {"gpu": 2}
+
+
 def test_parse_jobs_canonicalizes_decorated_running_state():
-    jobs = parse_jobs("alice|1|train|RUNNING+|gpu|node-1|gres/gpu=1|1:00:00|")
+    jobs = parse_jobs(sacct_row("gres/gpu=1", state="RUNNING+"))
     servers = parse_sinfo(
         "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536",
     )
@@ -129,8 +173,8 @@ def test_parse_jobs_canonicalizes_decorated_running_state():
 def test_parse_jobs_skips_inactive_rows_before_resource_parsing():
     output = "\n".join(
         [
-            "alice|1|train|RUNNING|gpu|node-1|gres/gpu=1|1:00:00|",
-            "alice|2|done|COMPLETED|gpu|node-1|gres/gpu=invalid|1:00:00|",
+            sacct_row("gres/gpu=1"),
+            sacct_row("gres/gpu=invalid", job_id="2", name="done", state="COMPLETED"),
         ]
     )
 
@@ -141,9 +185,31 @@ def test_parse_jobs_skips_inactive_rows_before_resource_parsing():
         parse_jobs(output)
 
 
+def test_parse_jobs_keeps_pipes_inside_job_names_and_constraints():
+    jobs = parse_jobs(
+        sacct_row("cpu=4,gres/gpu=2", name="seed-1|lr-0.1", constraints="a100|h100")
+    )
+
+    assert jobs[0].job_name == "seed-1|lr-0.1"
+    assert jobs[0].constraints == frozenset({"a100", "h100"})
+    assert jobs[0].usage.gpu == 2
+
+
+def test_parse_jobs_drops_running_records_long_past_their_time_limit():
+    output = "\n".join(
+        [
+            sacct_row("gres/gpu=1", job_id="1", time_limit="01:00:00", elapsed="13-22:47:58"),
+            sacct_row("gres/gpu=1", job_id="2", time_limit="01:00:00", elapsed="01:02:30"),
+            sacct_row("gres/gpu=1", job_id="3", time_limit="UNLIMITED", elapsed="30-00:00:00"),
+        ]
+    )
+
+    assert [job.job_id for job in parse_jobs(output)] == ["2", "3"]
+
+
 def test_parse_jobs_rejects_empty_state():
     with pytest.raises(ValueError, match="Malformed sacct record"):
-        parse_jobs("alice|1|train||gpu|node-1|gres/gpu=1|1:00:00|")
+        parse_jobs(sacct_row("gres/gpu=1", state=""))
 
 
 def test_parse_sinfo_rejects_any_malformed_nonblank_row():
@@ -172,7 +238,7 @@ def test_collector_surfaces_malformed_sinfo_as_cluster_parse_error():
     with pytest.raises(ClusterParseError, match="Malformed sinfo record on line 1"):
         collect_cluster_state(
             runner=runner,
-            options=CollectionOptions(parallel=False),
+            options=CollectionOptions(),
         )
 
 
@@ -234,7 +300,7 @@ def test_multi_node_user_total_is_conserved_before_rounding():
         ),
     )
     jobs = parse_jobs(
-        "alice|1|multi|RUNNING|gpu|node-[1-2]|cpu=8,gres/gpu=1,mem=16G|1:00:00|"
+        sacct_row("cpu=8,gres/gpu=1,mem=16G", name="multi", nodelist="node-[1-2]")
     )
 
     process_jobs(jobs, servers)
@@ -256,7 +322,7 @@ def test_multi_node_shard_occupancy_is_rounded_once_for_user_total():
         ),
     )
     jobs = parse_jobs(
-        "alice|1|multi|RUNNING|gpu|node-[1-2]|cpu=8,gres/shard=20,mem=16G|1:00:00|"
+        sacct_row("cpu=8,gres/shard=20,mem=16G", name="multi", nodelist="node-[1-2]")
     )
 
     process_jobs(jobs, servers)

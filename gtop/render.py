@@ -35,6 +35,9 @@ def help_legend() -> Text:
     legend.append("  ")
     legend.append("████", style=f"dim {OTHER_PARTITION_COLOR}")
     legend.append(" = unattributed usage\n")
+    legend.append("  ")
+    legend.append("××××", style="dim red")
+    legend.append(" = down or draining\n")
     legend.append("  counts after bars: priority / gpu / default")
     return legend
 NODE_COUNT_COLOR = "white"
@@ -167,16 +170,6 @@ def _pluralize(count: int, singular: str) -> str:
     return singular if count == 1 else f"{singular}s"
 
 
-def _resource_split(
-    server: ServerState,
-    resource: str,
-    show_shards: bool,
-) -> ResourceUsageSplit:
-    if resource == "gpu" and show_shards and server.gpu.shards > 0:
-        return server.usage["shard"]
-    return server.usage[resource]
-
-
 def _split_segments(values: Sequence[int], width: int) -> list[int]:
     total = sum(values)
     if width <= 0:
@@ -216,17 +209,20 @@ def _build_bar(
     *,
     free: int,
     width: int,
+    unavailable: int = 0,
 ) -> Text:
     segments = _partition_segments(partition_amounts)
     lengths = _split_segments(
-        [count for _, count, _ in segments] + [free],
+        [count for _, count, _ in segments] + [unavailable, free],
         width,
     )
     bar = Text()
     bar.append("[", style="dim")
-    for (_, _, color), segment_length in zip(segments, lengths[:-1]):
+    for (_, _, color), segment_length in zip(segments, lengths[:-2]):
         if segment_length:
             bar.append("█" * segment_length, style=f"dim {color}")
+    if lengths[-2]:
+        bar.append("×" * lengths[-2], style="dim red")
     if lengths[-1]:
         bar.append("·" * lengths[-1], style="dim")
     bar.append("]", style="dim")
@@ -535,3 +531,47 @@ def print_filtered_users(
     )
     active_console.print(table)
     active_console.print()
+
+
+def print_usage_history(
+    gpu_hours: Mapping[str, float],
+    accounts: Mapping[str, Sequence[str]],
+    *,
+    title: str,
+    console: Optional[Any] = None,
+    limit: int = 25,
+) -> None:
+    active_console = console or Console()
+    totals = sorted(gpu_hours.items(), key=lambda item: (-item[1], item[0]))
+    grand_total = sum(gpu_hours.values())
+    top = [(user, total) for user, total in totals[:limit] if round(total) > 0]
+    labs = {user: ",".join(accounts.get(user, ())) for user, _ in top}
+    include_full_name = _fits_width(
+        getattr(active_console, "width", None),
+        [
+            max(len(_top_user_label(user)) for user, _ in top),
+            9,
+            5,
+            max(len(lab) for lab in labs.values()),
+        ],
+    )
+
+    table = _data_table(show_header=True)
+    table.add_column("User", header_style="bold white", no_wrap=True)
+    table.add_column("GPU-hours", header_style="bold white", justify="right", no_wrap=True)
+    table.add_column("Share", header_style="bold white", justify="right", no_wrap=True)
+    table.add_column("Lab", header_style="bold white", no_wrap=True)
+    for user, total in top:
+        table.add_row(
+            Text(_top_user_label(user, include_full_name=include_full_name), style="cyan"),
+            Text(f"{round(total):,}", style="bold yellow"),
+            Text(f"{total / grand_total:.0%}", style=NODE_COUNT_COLOR),
+            Text(labs[user], style=NODE_COUNT_COLOR),
+        )
+    active_console.print(
+        Text.assemble(
+            (title, "bold cyan"),
+            (f"  {round(grand_total):,} GPU-hours, {len(totals)} users", "dim"),
+        )
+    )
+    active_console.print(table)

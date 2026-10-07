@@ -65,16 +65,8 @@ def run_commands(
     *,
     timeout: int,
     runner: Optional[CommandRunner] = None,
-    parallel: bool = True,
 ) -> Dict[str, CommandResult]:
     active_runner = runner or SubprocessRunner()
-
-    if not parallel:
-        return {
-            name: active_runner.run(command, timeout)
-            for name, command in commands.items()
-        }
-
     results: Dict[str, CommandResult] = {}
     with ThreadPoolExecutor(max_workers=min(len(commands), 4)) as executor:
         futures = {
