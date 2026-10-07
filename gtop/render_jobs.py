@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Collection, Mapping, Optional, Sequence
 
 from rich.cells import cell_len
@@ -8,10 +9,10 @@ from rich.console import (
     Console,
     ConsoleOptions,
     Group,
-    JustifyMethod,
     RenderResult,
 )
 from rich.segment import Segment
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -67,7 +68,7 @@ def _job_gpu_value(
     if unit == "shard" and servers is not None:
         shards = sum(
             server.allocations[job.job_id].usage.shard
-            for node in parse_nodelist(job.nodelist)
+            for node in _job_nodes(job.nodelist)
             if (
                 (server := servers.get(node)) is not None
                 and job.job_id in server.allocations
@@ -90,8 +91,13 @@ def _job_mem_value(job: JobRecord) -> str:
     return f"{_format_job_count(job.usage.mem)}G" if job.usage.mem > 0 else "-"
 
 
+@lru_cache(maxsize=4096)
+def _job_nodes(nodelist: str) -> tuple[str, ...]:
+    return tuple(parse_nodelist(nodelist))
+
+
 def _job_assignment(job: JobRecord) -> str:
-    return job.nodelist if parse_nodelist(job.nodelist) else "-"
+    return job.nodelist if _job_nodes(job.nodelist) else "-"
 
 
 def build_jobs_overview(jobs: Sequence[JobRecord], *, title: str) -> Text:
@@ -142,7 +148,7 @@ def _build_job_groups(
         nodes = {
             node
             for job in group_jobs
-            for node in parse_nodelist(job.nodelist)
+            for node in _job_nodes(job.nodelist)
             if node in servers
         }
         group_servers = [servers[node] for node in sorted(nodes)]
@@ -238,6 +244,7 @@ class _PlainTable:
     ) -> RenderResult:
         max_width = options.max_width
         rows = [[(header, "bold white") for header in self.headers], *self.rows]
+        cell_widths = [[_cell_width(cell) for cell in row] for row in rows]
         last = len(self.headers) - 1
         pads = [int(index < last) for index in range(len(self.headers))]
         minimums = [
@@ -245,11 +252,8 @@ class _PlainTable:
             for header, pad in zip(self.headers, pads)
         ]
         widths = [
-            max(
-                min(max(_cell_width(row[index]) for row in rows) + pad, max_width),
-                minimum,
-            )
-            for index, (pad, minimum) in enumerate(zip(pads, minimums))
+            max(min(max(column) + pad, max_width), minimum)
+            for column, pad, minimum in zip(zip(*cell_widths), pads, minimums)
         ]
         if sum(widths) > max_width:
             # Shrink wrappable columns the same way rich's Table does.
@@ -265,27 +269,35 @@ class _PlainTable:
                 )
             ]
 
-        for row_index, row in enumerate(rows):
+        content_widths = [width - pad for width, pad in zip(widths, pads)]
+        rights = [header in self.right for header in self.headers]
+        styles: dict[str, Style] = {}
+        wrapped: dict[tuple[str, int, bool], list[str]] = {}
+        # rich styles header padding with the header style.
+        header_gaps = [
+            (Segment(" ", console.get_style("bold white")),) if pad else ()
+            for pad in pads
+        ]
+        gaps = [(Segment(" "),) if pad else () for pad in pads]
+        new_line = Segment.line()
+        for row_index, (row, row_widths) in enumerate(zip(rows, cell_widths)):
             cells = [
                 _cell_lines(
-                    console,
-                    cell,
-                    width=width - pad,
-                    justify="right" if header in self.right else "left",
+                    console, styles, wrapped, cell, cell_width, width, right
                 )
-                for cell, header, width, pad in zip(row, self.headers, widths, pads)
+                for cell, cell_width, width, right in zip(
+                    row, row_widths, content_widths, rights
+                )
             ]
-            # rich styles header padding with the header style.
-            pad_style = console.get_style("bold white") if row_index == 0 else None
+            row_gaps = header_gaps if row_index == 0 else gaps
             for line_index in range(max(len(lines) for lines in cells)):
-                for lines, width, pad in zip(cells, widths, pads):
+                for lines, width, gap in zip(cells, content_widths, row_gaps):
                     if line_index < len(lines):
                         yield from lines[line_index]
                     else:
-                        yield Segment(" " * (width - pad))
-                    if pad:
-                        yield Segment(" " * pad, pad_style)
-                yield Segment.line()
+                        yield Segment(" " * width)
+                    yield from gap
+                yield new_line
 
 
 def _cell_width(cell: Text | tuple[str, str]) -> int:
@@ -294,30 +306,38 @@ def _cell_width(cell: Text | tuple[str, str]) -> int:
 
 def _cell_lines(
     console: Console,
+    styles: dict[str, Style],
+    wrapped: dict[tuple[str, int, bool], list[str]],
     cell: Text | tuple[str, str],
-    *,
+    cell_width: int,
     width: int,
-    justify: JustifyMethod,
-) -> list[list[Segment]]:
+    right: bool,
+) -> Sequence[Sequence[Segment]]:
     if isinstance(cell, Text):
         style = console.get_style(cell.style)
-        padding = Segment(" " * (width - cell.cell_len), style)
+        padding = Segment(" " * (width - cell_width), style)
         segments = list(Segment.apply_style(cell.render(console), style))
-        return [[padding, *segments] if justify == "right" else [*segments, padding]]
+        return ([padding, *segments] if right else [*segments, padding],)
     value, style_name = cell
-    style = console.get_style(style_name)
-    value_width = cell_len(value)
-    if value_width > width:
-        return [
-            [Segment(line.plain, style)]
-            for line in Text(value).wrap(
-                console, width, justify=justify, overflow="fold"
-            )
-        ]
-    padding = " " * (width - value_width)
-    return [
-        [Segment(padding + value if justify == "right" else value + padding, style)]
-    ]
+    style = styles.get(style_name)
+    if style is None:
+        style = styles[style_name] = console.get_style(style_name)
+    if cell_width > width:
+        key = (value, width, right)
+        lines = wrapped.get(key)
+        if lines is None:
+            lines = wrapped[key] = [
+                line.plain
+                for line in Text(value).wrap(
+                    console,
+                    width,
+                    justify="right" if right else "left",
+                    overflow="fold",
+                )
+            ]
+        return [(Segment(line, style),) for line in lines]
+    padding = " " * (width - cell_width)
+    return ((Segment(padding + value if right else value + padding, style),),)
 
 
 def _capacity_table(
@@ -333,7 +353,8 @@ def _capacity_table(
         _max_width("Capacity", [value.plain for value in capacities]),
         _max_width("Jobs", job_labels),
     ]
-    split_width = max(len(_build_split(group.partitions).plain) for group in groups)
+    splits = [_build_split(group.partitions) for group in groups]
+    split_width = max(len(split.plain) for split in splits)
     include_bar, include_split = _detail_policy(
         width,
         required_widths=required_widths,
@@ -363,7 +384,9 @@ def _capacity_table(
         headers.append("Partitions")
     headers.append("Jobs")
     rows = []
-    for group, capacity, jobs_label in zip(groups, capacities, job_labels):
+    for group, capacity, jobs_label, split in zip(
+        groups, capacities, job_labels, splits
+    ):
         row: list[Text | tuple[str, str]] = [
             (group.assignment, "bold cyan"),
             (group.gpu_type, "white"),
@@ -378,7 +401,7 @@ def _capacity_table(
                 )
             )
         if include_split:
-            row.append(_build_split(group.partitions))
+            row.append(split)
         row.append((jobs_label, "white"))
         rows.append(row)
     return _PlainTable(headers, rows)
@@ -437,26 +460,28 @@ class _JobCards:
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
         label_style = console.get_style("bold white")
-        white = console.get_style("white")
+        styles: dict[str, Style] = {}
+        new_line = Segment.line()
         for row_index, row in enumerate(self.rows):
             if row_index:
-                yield Segment.line()
-            values = dict(zip(_DETAIL_HEADERS, row))
-            for label in ("ID", "Node", "Partition", "State", "User", "Time", "Name"):
-                style = {
-                    "ID": "bright_black",
-                    "Partition": _partition_color(values[label]),
-                    "State": _job_state_style(values[label]),
-                    "User": "cyan",
-                }.get(label, "white")
-                yield Segment(f"{label}: ", label_style)
-                yield Segment(values[label], console.get_style(style))
-                yield Segment.line()
-            yield Segment("GPU/CPU/MEM: ", label_style)
-            yield Segment(
-                "/".join(values[label] for label in ("GPU", "CPU", "MEM")), white
-            )
-            yield Segment.line()
+                yield new_line
+            job_id, node, state, user, partition, gpu, cpu, mem, time, name = row
+            for label, value, style_name in (
+                ("ID: ", job_id, "bright_black"),
+                ("Node: ", node, "white"),
+                ("Partition: ", partition, _partition_color(partition)),
+                ("State: ", state, _job_state_style(state)),
+                ("User: ", user, "cyan"),
+                ("Time: ", time, "white"),
+                ("Name: ", name, "white"),
+                ("GPU/CPU/MEM: ", f"{gpu}/{cpu}/{mem}", "white"),
+            ):
+                style = styles.get(style_name)
+                if style is None:
+                    style = styles[style_name] = console.get_style(style_name)
+                yield Segment(label, label_style)
+                yield Segment(value, style)
+                yield new_line
 
 
 def _job_details(
