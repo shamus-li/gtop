@@ -93,13 +93,24 @@ class ServerState:
     gpu: GpuInfo
     cpu: CpuInfo
     mem: MemoryInfo
+    # sinfo's long state, e.g. "mixed", "drained*", "mixed-" (planned).
+    state: str
+    reason: str
     usage: Dict[str, ResourceUsageSplit] = field(default_factory=_default_usage_splits)
     allocations: Dict[str, NodeAllocation] = field(default_factory=dict)
 
     @property
     def accepts_jobs(self) -> bool:
-        """sinfo reports CPUs on down or draining nodes as "other"."""
-        return self.cpu.other == 0
+        """sinfo reports CPUs on down or draining nodes as "other", except the
+        CPUs still allocated on a draining node, so the state is checked too."""
+        return self.cpu.other == 0 and not any(
+            word in self.state for word in ("drain", "down", "fail")
+        )
+
+    @property
+    def planned(self) -> bool:
+        """Idle resources held for a pending job; sinfo marks the state with "-"."""
+        return self.state.endswith("-")
 
     def has_target_users(self, target_users: Set[str]) -> bool:
         return any(

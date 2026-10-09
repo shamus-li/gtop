@@ -10,29 +10,9 @@ from rich.text import Text
 from .models import JobRecord, NodeAllocation, ServerState
 from .partitions import partition_names
 from .render import _display_gpu_type
-from .runner import Command
+from .render_json import job_resources, node_capacity
 from .scheduling import INTERACTIVE_SUFFIX, Partition
-
-
-def node_state_command(nodes: Sequence[str]) -> Command:
-    return ("sinfo", "-h", "-N", "-n", ",".join(nodes), "-o", "%n|%T|%E")
-
-
-@dataclass(frozen=True)
-class NodeStatus:
-    state: str
-    reason: str
-
-
-def parse_node_states(output: str) -> dict[str, NodeStatus]:
-    states: dict[str, NodeStatus] = {}
-    for line in output.splitlines():
-        name, _, rest = line.partition("|")
-        state, _, reason = rest.partition("|")
-        states[name] = NodeStatus(
-            state=state, reason="" if reason == "none" else reason
-        )
-    return states
+from .slurm import array_task_count
 
 
 def _partitions_on(node: str, partitions: Mapping[str, Partition]) -> list[Partition]:
@@ -106,7 +86,9 @@ def queued_for(
             listed.append(job)
             continue
         for name in requested & shared_names:
-            shared_counts[name] = shared_counts.get(name, 0) + 1
+            shared_counts[name] = shared_counts.get(name, 0) + array_task_count(
+                job.job_id
+            )
     listed.sort(key=lambda job: (job.partition, job.user, job.job_id))
     return QueuedJobs(
         lab_partitions=tuple(partition.name for partition in labs),
@@ -125,7 +107,6 @@ def _number(value: float) -> str:
 
 def render_node(
     server: ServerState,
-    status: NodeStatus,
     partitions: Mapping[str, Partition],
     queued: QueuedJobs,
 ) -> Group:
@@ -138,7 +119,7 @@ def render_node(
         Text.assemble(
             (server.name, "bold cyan"),
             f"  {server.gpu.num}× {gpu_type}  " if server.gpu.num else f"  {gpu_type}  ",
-            (status.state, "green" if server.accepts_jobs else "red"),
+            (server.state, "green" if server.accepts_jobs else "red"),
         ),
         Text(
             f"GPUs {used_gpus}/{server.gpu.num} used · "
@@ -153,8 +134,8 @@ def render_node(
             style="dim",
         ),
     ]
-    if status.reason:
-        lines.append(Text(f"Reason: {status.reason}", style="red"))
+    if server.reason:
+        lines.append(Text(f"Reason: {server.reason}", style="red"))
     allocations = _sorted_allocations(server, partitions)
     if allocations:
         lines.append(_running_table(allocations))
@@ -167,7 +148,7 @@ def render_node(
 def _queued_lines(queued: QueuedJobs) -> list[Any]:
     lines: list[Any] = [Text("")]
     if queued.lab_partitions:
-        count = len(queued.listed)
+        count = sum(array_task_count(job.job_id) for job in queued.listed)
         lines.append(
             Text(
                 f"Queued in {', '.join(queued.lab_partitions)}: "
@@ -206,7 +187,8 @@ def _queued_table(listed: Sequence[JobRecord]) -> Table:
     table = Table(box=None, pad_edge=False, padding=(0, 1), header_style="bold white")
     table.add_column("User", no_wrap=True, style="cyan")
     table.add_column("Jobs", no_wrap=True, style="dim")
-    table.add_column("Partition", no_wrap=True)
+    # The only column that shortens on a narrow terminal.
+    table.add_column("Partition", overflow="ellipsis")
     for label in ("GPU", "CPU", "RAM"):
         table.add_column(label, justify="right", no_wrap=True)
     if show_reason:
@@ -214,7 +196,9 @@ def _queued_table(listed: Sequence[JobRecord]) -> Table:
     for (user, partition, gpu, cpu, mem, reason), job_ids in groups.items():
         row = [
             user,
-            job_ids[0] if len(job_ids) == 1 else f"{len(job_ids)} jobs",
+            job_ids[0]
+            if len(job_ids) == 1
+            else f"{sum(map(array_task_count, job_ids))} jobs",
             partition,
             _number(gpu) if gpu else "-",
             _number(cpu) if cpu else "-",
@@ -230,7 +214,8 @@ def _running_table(allocations: Sequence[NodeAllocation]) -> Table:
     table = Table(box=None, pad_edge=False, padding=(0, 1), header_style="bold white")
     table.add_column("User", no_wrap=True, style="cyan")
     table.add_column("Job", no_wrap=True, style="dim")
-    table.add_column("Partition", no_wrap=True)
+    # The only column that shortens on a narrow terminal.
+    table.add_column("Partition", overflow="ellipsis")
     for label in ("GPU", "CPU", "RAM"):
         table.add_column(label, justify="right", no_wrap=True)
     table.add_column("Elapsed", justify="right", no_wrap=True)
@@ -251,24 +236,15 @@ def _running_table(allocations: Sequence[NodeAllocation]) -> Table:
 
 def node_json(
     server: ServerState,
-    status: NodeStatus,
     partitions: Mapping[str, Partition],
     queued: QueuedJobs,
 ) -> dict[str, Any]:
     return {
         "name": server.name,
         "gpu_type": _display_gpu_type(server) if server.gpu.num else None,
-        "state": status.state,
-        "reason": status.reason,
-        "gpus": {"total": server.gpu.num, "used": server.gpu.occupied()},
-        "cpus": {
-            "total": server.cpu.total,
-            "used": server.cpu.total - server.cpu.idle - server.cpu.other,
-        },
-        "memory_gib": {
-            "total": round(server.mem.total / 1024),
-            "used": round((server.mem.total - server.mem.idle) / 1024),
-        },
+        "state": server.state,
+        "reason": server.reason,
+        **node_capacity(server),
         "partitions": {
             partition.name: partition.tier
             for partition in _partitions_on(server.name, partitions)
@@ -278,9 +254,7 @@ def node_json(
                 "job_id": allocation.job.job_id,
                 "user": allocation.job.user,
                 "partition": allocation.job.partition,
-                "gpus": allocation.usage.gpu,
-                "cpus": allocation.usage.cpu,
-                "memory_gib": round(allocation.usage.mem, 1),
+                "resources": job_resources(allocation.usage),
                 "elapsed": allocation.job.elapsed,
             }
             for allocation in _sorted_allocations(server, partitions)
@@ -290,9 +264,7 @@ def node_json(
                 "job_id": job.job_id,
                 "user": job.user,
                 "partition": job.partition,
-                "gpus": job.usage.gpu,
-                "cpus": job.usage.cpu,
-                "memory_gib": round(job.usage.mem, 1),
+                "resources": job_resources(job.usage),
                 "reason": job.reason,
             }
             for job in queued.listed

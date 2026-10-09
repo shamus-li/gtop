@@ -3,12 +3,20 @@
 
 from pathlib import Path
 
+import pytest
+
 
 from gtop.constants import SACCT_COMMAND, SINFO_COMMAND, SINFO_FIELD_WIDTHS
 from gtop.accounting import process_jobs, summarize_users
 from gtop.render_cluster import visible_servers
 from gtop.resources import parse_gpu
-from gtop.slurm import expand_range, parse_features_field, parse_jobs, parse_sinfo
+from gtop.slurm import (
+    array_task_count,
+    expand_range,
+    parse_features_field,
+    parse_jobs,
+    parse_sinfo,
+)
 from sacct_rows import sacct_row
 
 FIXTURE_DIR = Path(__file__).resolve().parent
@@ -155,9 +163,9 @@ def test_visible_servers_preserves_feature_and_free_capacity_order():
     servers = parse_sinfo(
         "\n".join(
             [
-                "node-b|gpu-low|gpu:test:2|gpu:test:1(IDX:0)|0/0/0/0|0|0",
-                "node-d|gpu-high|gpu:test:4|gpu:test:3(IDX:0-2)|0/0/0/0|0|0",
-                "node-a|gpu-high|gpu:test:4|gpu:test:1(IDX:0)|0/0/0/0|0|0",
+                "node-b|gpu-low|gpu:test:2|gpu:test:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+                "node-d|gpu-high|gpu:test:4|gpu:test:3(IDX:0-2)|0/0/0/0|0|0|mixed|none",
+                "node-a|gpu-high|gpu:test:4|gpu:test:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ]
         )
     )
@@ -177,6 +185,8 @@ def test_parse_sinfo_fixed_width_line():
         "10/22/0/32",
         "2048",
         "65536",
+        "mixed",
+        "none",
     ]
 
     segments = [value.ljust(width) for value, width in zip(fields, SINFO_FIELD_WIDTHS)]
@@ -255,8 +265,8 @@ def test_process_jobs_does_not_reallocate_filtered_nodes():
     servers = parse_sinfo(
         "\n".join(
             [
-                "node-1|gpu-high|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
-                "node-2|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
+                "node-1|gpu-high|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
+                "node-2|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
             ]
         ),
     )
@@ -300,3 +310,17 @@ def test_stale_year_history_waits_for_refresh_but_week_refreshes(tmp_path, monke
         refresh.assert_not_called()
         assert history.cached_history("week") is not None
         refresh.assert_called_once_with("week")
+
+
+@pytest.mark.parametrize(
+    ("job_id", "tasks"),
+    [
+        ("123", 1),
+        ("123_4", 1),
+        ("135000_[269-999%25]", 731),
+        ("108203_[12-14,16-35,37-41%12]", 28),
+        ("77_[1-9:2]", 5),
+    ],
+)
+def test_array_task_count_counts_pending_array_ranges(job_id: str, tasks: int):
+    assert array_task_count(job_id) == tasks

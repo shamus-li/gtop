@@ -50,7 +50,8 @@ def build_availability(
             counts = totals.setdefault(_display_gpu_type(server), [0, 0, 0])
             counts[0] += free
             counts[1] += max(reachable - free, 0)
-            counts[2] += now.gpus - free
+            # Idle GPUs that preempting makes usable count as +Preempt, not Short.
+            counts[2] += max(now.gpus - max(reachable, free), 0)
         rows = sorted(
             (
                 GpuTypeRow(

@@ -36,7 +36,7 @@ would get by preempting jobs in lower-priority partitions. A node's GPUs count
 as free when one job could take them plus 4 CPUs and 16G RAM on that node;
 idle GPUs on nodes without that much CPU or RAM are listed as short. Use
 `-t high`, `-t mid` or `-t low` to show only one GPU tier, and `-C` to require
-node features: `gtop -C nvlink 'ampere|ada|hopper|blackwell'` shows modern GPUs
+node features: `gtop -C 'nvlink,ampere|ada|hopper|blackwell'` shows modern GPUs
 with NVLink. `gtop nodes` takes the same filters.
 
 ```bash
@@ -71,7 +71,8 @@ gtop jobs -m
 Running, pending and requeued jobs.
 
 Every command takes `-p PARTITION` and `--json`; `nodes`, `users` and `jobs`
-also take `-m` (your usage) or `-u USER`.
+also take `-m` (your usage) or `-u USER`. Give several partitions, users or
+features as a comma-separated list: `gtop jobs -u alice,bob -p gpu,default`.
 
 ## Help
 

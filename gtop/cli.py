@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import re
 import shlex
 import sys
@@ -35,7 +36,13 @@ from .constants import (
     SINFO_COMMAND,
     SQUEUE_COMMAND,
 )
-from .history import HistoryError, cached_history, fetch_history
+from .history import (
+    WINDOWS,
+    HistoryError,
+    UsageHistory,
+    cached_history,
+    fetch_history,
+)
 from .models import ClusterState, JobRecord, ServerState, UserUsage
 from .partitions import partition_names
 from .render import (
@@ -45,12 +52,10 @@ from .render import (
     print_usage_history,
 )
 from .render_cluster import render_table, visible_servers
-from .render_json import jobs_json, nodes_json, summary_json, top_users_json
+from .render_json import jobs_json, nodes_json, users_json
 from .render_jobs import render_jobs_view
 from .render_node import (
     node_json,
-    node_state_command,
-    parse_node_states,
     queued_for,
     render_node,
 )
@@ -66,7 +71,6 @@ from .scheduling import (
 )
 from .slurm import parse_nodelist
 
-COMMANDS = ("available", "nodes", "users", "jobs")
 GPU_TIERS = ("high", "mid", "low", "all")
 AVAILABLE_HELP = (
     "gtop columns, per partition you can submit to:\n"
@@ -81,6 +85,34 @@ class GtopArgumentParser(argparse.ArgumentParser):
     def print_help(self, file: Optional[Any] = None) -> None:
         super().print_help(file)
         Console(file=file).print(help_legend())
+
+
+class _StdoutConsole(Console):
+    def on_broken_pipe(self) -> None:
+        # Rich exits 1 here; main() exits cleanly when head or a pager closes the pipe.
+        raise BrokenPipeError
+
+
+def _stdout_console() -> Console:
+    # Rich lays out piped output at 80 columns, which wraps rows that grep then misses.
+    if sys.stdout.isatty() or "COLUMNS" in os.environ:
+        return _StdoutConsole()
+    return _StdoutConsole(width=100_000)
+
+
+def _no_matches(
+    args: argparse.Namespace,
+    console: Optional[Any],
+    diagnostic_console: Any,
+    message: str,
+    empty_payload: dict[str, Any],
+) -> int:
+    """An empty result: a message, or with --json an empty payload for scripts."""
+    diagnostic_console.print(Text(message, style="yellow"))
+    if args.json:
+        _write_json_output(empty_payload, console)
+        return EXIT_SUCCESS
+    return EXIT_NO_MATCHES
 
 
 def _write_json_output(payload: Any, console: Optional[Any]) -> None:
@@ -164,19 +196,28 @@ def _filtered_jobs(
 _FEATURE = re.compile(r"[a-z0-9_.:+-]+")
 
 
-def _feature_arg(value: str) -> frozenset[str]:
-    """One -C value: features separated by "|", any of which may match."""
-    alternatives = frozenset(part.strip().lower() for part in value.split("|"))
-    if not all(_FEATURE.fullmatch(part) for part in alternatives):
+def _comma_list(value: str) -> list[str]:
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError(f"expected comma-separated names, got {value!r}")
+    return names
+
+
+def _feature_arg(value: str) -> list[frozenset[str]]:
+    """A -C value: required features separated by ",", each "a|b" matching either."""
+    groups = [
+        frozenset(part.strip().lower() for part in item.split("|"))
+        for item in _comma_list(value)
+    ]
+    if not all(_FEATURE.fullmatch(part) for group in groups for part in group):
         raise argparse.ArgumentTypeError(f"invalid feature {value!r}")
-    return alternatives
+    return groups
 
 
 def _positive_int(value: str) -> int:
-    number = int(value)
-    if number < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return number
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"expected a whole number of at least 1, got {value!r}")
+    return int(value)
 
 
 def _node_matches(server: ServerState, args: argparse.Namespace) -> bool:
@@ -191,7 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = GtopArgumentParser(
         prog="gtop",
         description="Show live SLURM GPU capacity and usage",
-        epilog=AVAILABLE_HELP,
+        epilog=f"{AVAILABLE_HELP}\n\n"
+        "Options for the default view (-t, -C, -p, --json): gtop available -h",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -200,8 +242,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "-p",
         "--partition",
-        nargs="+",
-        help="Limit to nodes in one or more partitions",
+        action="extend",
+        type=partition_names,
+        metavar="PARTITION[,...]",
+        help="Limit to nodes in these partitions",
     )
     common.add_argument("--json", action="store_true", help="Emit this view as JSON")
 
@@ -216,16 +260,23 @@ def build_parser() -> argparse.ArgumentParser:
     tier.add_argument(
         "-C",
         "--constraint",
-        nargs="+",
+        action="extend",
         type=_feature_arg,
-        metavar="FEATURE",
+        metavar="FEATURE[,...]",
         help="Only nodes with every listed feature; a|b matches either "
-        "(e.g. -C nvlink 'ampere|ada')",
+        "(e.g. -C 'nvlink,ampere|ada')",
     )
 
     users_filter = GtopArgumentParser(add_help=False)
     selection = users_filter.add_mutually_exclusive_group()
-    selection.add_argument("-u", "--users", nargs="+", help="Filter by usernames")
+    selection.add_argument(
+        "-u",
+        "--users",
+        action="extend",
+        type=_comma_list,
+        metavar="USER[,...]",
+        help="Filter by usernames",
+    )
     selection.add_argument(
         "-m", "--me", action="store_true", help="Filter to your own usage"
     )
@@ -283,14 +334,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _commands_accepting(parser: argparse.ArgumentParser, option: str) -> list[str]:
+    subparsers = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    return [
+        name
+        for name, subparser in subparsers.choices.items()
+        if option in subparser._option_string_actions
+    ]
+
+
 def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments or arguments[0] not in (*COMMANDS, "-h", "--help"):
+    # Options alone run the default view; a mistyped command still reaches argparse.
+    if not arguments or (
+        arguments[0].startswith("-") and arguments[0] not in ("-h", "--help")
+    ):
         arguments.insert(0, "available")
     parser = build_parser()
-    args = parser.parse_args(arguments)
+    args, unknown = parser.parse_known_args(arguments)
+    if unknown:
+        message = f"unrecognized arguments: {' '.join(unknown)}"
+        commands = _commands_accepting(parser, unknown[0])
+        if commands:
+            message += f" ({unknown[0]} works with: " + ", ".join(
+                f"gtop {command}" for command in commands
+            ) + ")"
+        parser.error(message)
     if getattr(args, "window", None) and (args.users or args.me or args.partition):
         parser.error("--week/--month/--year cannot be combined with -u, -m or -p")
+    if args.command == "nodes" and args.names and (
+        args.tier != "all" or args.constraint or args.users or args.me or args.partition
+    ):
+        parser.error("node names cannot be combined with -t, -C, -u, -m or -p")
     if getattr(args, "refresh", False) and not args.window:
         parser.error("--refresh needs --week, --month or --year")
     return args
@@ -304,7 +383,7 @@ def cli_main(
     stderr_console: Optional[Any] = None,
 ) -> int:
     args = _parse_args(argv)
-    active_console = console or Console()
+    active_console = console or _stdout_console()
     active_stderr = stderr_console or Console(stderr=True)
     diagnostic_console = active_stderr if args.json else active_console
     active_runner = runner or SubprocessRunner()
@@ -333,15 +412,7 @@ def cli_main(
     if getattr(args, "me", False):
         target_users.add(getpass.getuser())
     target_user_filter: Optional[Set[str]] = target_users or None
-    partition_filter = (
-        tuple(
-            partition
-            for value in args.partition
-            for partition in partition_names(value)
-        )
-        if args.partition
-        else None
-    )
+    partition_filter = tuple(dict.fromkeys(args.partition)) if args.partition else None
 
     if args.command == "jobs":
         sacct_command = _sacct_command(
@@ -452,15 +523,15 @@ def cli_main(
         else servers
     )
     if not display_servers:
-        diagnostic_console.print(
-            Text(
-                "No usage found matching the criteria."
-                if target_user_filter
-                else "No nodes match these filters.",
-                style="yellow",
-            )
+        return _no_matches(
+            args,
+            console,
+            diagnostic_console,
+            "No usage found matching the criteria."
+            if target_user_filter
+            else "No nodes match these filters.",
+            users_json([], unit=unit) if args.command == "users" else nodes_json([]),
         )
-        return EXIT_NO_MATCHES
 
     if args.command == "users" and not target_user_filter:
         top_users = sorted(
@@ -472,12 +543,15 @@ def cli_main(
             ),
         )[: args.limit]
         if not top_users:
-            diagnostic_console.print(
-                Text("No users found matching the criteria.", style="yellow")
+            return _no_matches(
+                args,
+                console,
+                diagnostic_console,
+                "No users found matching the criteria.",
+                users_json([], unit=unit),
             )
-            return EXIT_NO_MATCHES
         if args.json:
-            _write_json_output(top_users_json(top_users, unit=unit), console)
+            _write_json_output(users_json(top_users, unit=unit), console)
             return EXIT_SUCCESS
         if partition_filter:
             _print_partition_scope(active_console, partition_filter)
@@ -488,7 +562,10 @@ def cli_main(
         payload = (
             nodes_json(display_servers)
             if args.command == "nodes"
-            else summary_json(display_servers)
+            else users_json(
+                [all_users.get(user, UserUsage(user=user)) for user in sorted(target_users)],
+                unit=unit,
+            )
         )
         _write_json_output(payload, console)
         return EXIT_SUCCESS
@@ -543,26 +620,21 @@ def _node_detail_view(
         allow_empty_servers=True,
     )
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             partition_future = executor.submit(
                 runner.run, PARTITION_COMMAND, DEFAULT_TIMEOUT
-            )
-            state_future = executor.submit(
-                runner.run, node_state_command(args.names), DEFAULT_TIMEOUT
             )
             state = collect_cluster_state(
                 runner=runner, options=options, stderr_console=stderr_console
             )
             partition_result = partition_future.result()
-            state_result = state_future.result()
     except CommandExecutionError as error:
         return _command_failed(stderr_console, error.command_name, error.result)
     except ClusterParseError as error:
         stderr_console.print(Text(str(error), style="red"))
         return EXIT_PARSE_ERROR
-    for name, result in (("scontrol", partition_result), ("sinfo", state_result)):
-        if result.returncode != 0:
-            return _command_failed(stderr_console, name, result)
+    if partition_result.returncode != 0:
+        return _command_failed(stderr_console, "scontrol", partition_result)
 
     missing = [name for name in args.names if name not in state.servers]
     if missing:
@@ -571,7 +643,6 @@ def _node_detail_view(
         )
         return EXIT_NO_MATCHES
     partitions = parse_partitions(partition_result.stdout)
-    statuses = parse_node_states(state_result.stdout)
     servers = [state.servers[name] for name in dict.fromkeys(args.names)]
     if args.json:
         _write_json_output(
@@ -580,7 +651,6 @@ def _node_detail_view(
                 "nodes": [
                     node_json(
                         server,
-                        statuses[server.name],
                         partitions,
                         queued_for(server.name, state.jobs, partitions),
                     )
@@ -596,7 +666,6 @@ def _node_detail_view(
         active_console.print(
             render_node(
                 server,
-                statuses[server.name],
                 partitions,
                 queued_for(server.name, state.jobs, partitions),
             )
@@ -621,7 +690,11 @@ def _available_view(
         if _node_matches(server, args)
     }
     if partition_filter:
-        shown = [partitions[name] for name in partition_filter if name in partitions]
+        shown = [
+            partitions[name]
+            for name in partition_filter
+            if name in partitions and partitions[name].nodes & servers.keys()
+        ]
     else:
         shown = [
             partition
@@ -631,10 +704,13 @@ def _available_view(
             if partition.nodes & servers.keys()
         ]
     if not shown:
-        diagnostic_console.print(
-            Text("No partitions you can use have matching GPU nodes.", style="yellow")
+        return _no_matches(
+            args,
+            console,
+            diagnostic_console,
+            "No partitions you can use have matching GPU nodes.",
+            availability_json([]),
         )
-        return EXIT_NO_MATCHES
 
     results = build_availability(servers, partitions, shown)
     if args.json:
@@ -660,33 +736,37 @@ def _history_view(
                 Text(f"Querying {args.window} history from sreport...", style="dim")
             )
         try:
-            history = fetch_history(args.window, runner=runner, timeout=900)
+            history = fetch_history(args.window, runner=runner)
         except HistoryError as error:
             stderr_console.print(Text(str(error), style="red"))
             return EXIT_COMMAND_ERROR
 
-    if not any(hours >= 0.5 for hours in history.gpu_hours.values()):
-        diagnostic_console.print(Text("No GPU usage in this window.", style="yellow"))
-        return EXIT_NO_MATCHES
-
-    if args.json:
-        _write_json_output(
+    payload = {
+        "view": f"users-{args.window}",
+        "generated_at": history.generated_at,
+        "unit": "GPU-hours",
+        "users": [
             {
-                "view": f"users-{args.window}",
-                "generated_at": history.generated_at,
-                "gpu_hours": {
-                    user: round(hours, 1)
-                    for user, hours in sorted(history.gpu_hours.items())
-                },
-                "accounts": history.accounts,
-            },
-            console,
+                "rank": rank,
+                "user": user,
+                "total": round(hours, 1),
+                "accounts": history.accounts.get(user, []),
+            }
+            for rank, (user, hours) in enumerate(
+                history.ranked()[: args.limit], start=1
+            )
+        ],
+    }
+    if not payload["users"]:
+        return _no_matches(
+            args, console, diagnostic_console, "No GPU usage in this window.", payload
         )
+    if args.json:
+        _write_json_output(payload, console)
         return EXIT_SUCCESS
-    title = f"GPU use, last {args.window}" + _age_label(history.age_seconds())
+    title = f"GPU use, last {args.window}" + _age_label(args.window, history)
     print_usage_history(
-        history.gpu_hours,
-        history.accounts,
+        history,
         title=title,
         limit=args.limit,
         console=active_console,
@@ -694,15 +774,23 @@ def _history_view(
     return EXIT_SUCCESS
 
 
-def _age_label(seconds: float) -> str:
+def _age_label(window: str, history: UsageHistory) -> str:
+    seconds = history.age_seconds()
     minutes = int(seconds // 60)
     if minutes < 1:
         return ""
     if minutes < 120:
-        return f" (as of {minutes} min ago)"
-    if minutes < 48 * 60:
-        return f" (as of {minutes // 60} h ago)"
-    return f" (as of {minutes // 1440} days ago; --refresh to update)"
+        age = f"{minutes} min"
+    elif minutes < 48 * 60:
+        age = f"{minutes // 60} h"
+    else:
+        age = f"{minutes // 1440} days"
+    max_age = WINDOWS[window][1]
+    if max_age is None:
+        return f" (as of {age} ago; --refresh to update)"
+    if seconds > max_age:
+        return f" (as of {age} ago; updating in the background)"
+    return f" (as of {age} ago)"
 
 
 def _jobs_view(
@@ -721,10 +809,13 @@ def _jobs_view(
         server_names=set(state.servers),
     )
     if not jobs:
-        diagnostic_console.print(
-            Text("No jobs found matching the criteria.", style="yellow")
+        return _no_matches(
+            args,
+            console,
+            diagnostic_console,
+            "No jobs found matching the criteria.",
+            jobs_json([]),
         )
-        return EXIT_NO_MATCHES
     if args.json:
         _write_json_output(jobs_json(jobs), console)
         return EXIT_SUCCESS

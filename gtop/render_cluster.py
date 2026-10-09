@@ -168,10 +168,14 @@ def _group_servers(
         )
         for gpu_type, members in grouped.items()
     ]
+    # Strongest GPU types first, matching the availability view.
     return sorted(
         groups,
         key=lambda item: (
-            *_gpu_capability_rank(item[0]),
+            *(
+                -rank if isinstance(rank, int) else rank
+                for rank in _gpu_capability_rank(item[0])
+            ),
             -sum(count(server, "gpu") for server in item[1]),
         ),
     )

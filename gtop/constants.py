@@ -77,13 +77,16 @@ SQUEUE_COMMAND: Command = (
 
 SINFO_COMMAND: Command = (
     "sinfo",
+    # Without -a, sinfo hides nodes that are only in partitions the user cannot use.
+    "-a",
     "-N",
     "-O",
-    "nodehost:100,features:200,gres:256,gresused:256,cpusstate:100,allocmem:100,memory:100",
+    "nodehost:100,features:200,gres:256,gresused:256,cpusstate:100,allocmem:100,"
+    "memory:100,statelong:50,reason:300",
     "--exact",
     "-h",
 )
-SINFO_FIELD_WIDTHS = (100, 200, 256, 256, 100, 100, 100)
+SINFO_FIELD_WIDTHS = (100, 200, 256, 256, 100, 100, 100, 50, 300)
 
 JOB_RESOURCE_NAMES = ("cpu", "gpu", "mem", "shard")
 EXIT_SUCCESS = 0

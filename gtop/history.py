@@ -14,6 +14,8 @@ from .runner import Command, CommandRunner, SubprocessRunner
 # Window: (days, seconds before a cached result is refreshed in the background).
 # The year query loads slurmdbd for over a minute, so it only refreshes on request.
 WINDOWS = {"week": (7, 3600), "month": (30, 6 * 3600), "year": (365, None)}
+# A background refresh holds its lock at most this long, the sreport timeout.
+SREPORT_TIMEOUT = 900
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,16 @@ class UsageHistory:
 
     def age_seconds(self) -> float:
         return max(time.time() - self.generated_at, 0.0)
+
+    def ranked(self) -> list[tuple[str, float]]:
+        """Users with at least half a GPU-hour, most first."""
+        return [
+            (user, hours)
+            for user, hours in sorted(
+                self.gpu_hours.items(), key=lambda item: (-item[1], item[0])
+            )
+            if round(hours) > 0
+        ]
 
 
 class HistoryError(RuntimeError):
@@ -87,7 +99,11 @@ def _write_cache(window: str, history: UsageHistory) -> None:
     path = _cache_path(window)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(asdict(history)))
+    # Other users' GPU-hours: keep the cache private even under a shared cache root.
+    with os.fdopen(
+        os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w"
+    ) as file:
+        file.write(json.dumps(asdict(history)))
     temporary.replace(path)
 
 
@@ -95,9 +111,10 @@ def fetch_history(
     window: str,
     *,
     runner: Optional[CommandRunner] = None,
-    timeout: int,
 ) -> UsageHistory:
-    result = (runner or SubprocessRunner()).run(history_command(window), timeout)
+    result = (runner or SubprocessRunner()).run(
+        history_command(window), SREPORT_TIMEOUT
+    )
     if result.returncode != 0:
         raise HistoryError(result.stderr.strip() or "sreport history query failed")
     history = parse_history(result.stdout, now=time.time())
@@ -108,7 +125,7 @@ def fetch_history(
 def _claim_refresh(window: str) -> bool:
     lock = _cache_path(window).with_suffix(".lock")
     try:
-        if time.time() - lock.stat().st_mtime < 600:
+        if time.time() - lock.stat().st_mtime < SREPORT_TIMEOUT:
             return False
         lock.unlink()
     except FileNotFoundError:
@@ -144,6 +161,6 @@ def cached_history(window: str) -> Optional[UsageHistory]:
 
 if __name__ == "__main__":
     try:
-        fetch_history(sys.argv[1], timeout=900)
+        fetch_history(sys.argv[1])
     finally:
         _cache_path(sys.argv[1]).with_suffix(".lock").unlink(missing_ok=True)

@@ -91,15 +91,20 @@ def obtainable(
     """Resources a job at this priority tier can get now, and by preempting.
 
     With partition_prio preemption, a job requeues running jobs from
-    lower-tier partitions on the same node.
+    lower-tier partitions on the same node. A planned node's idle resources
+    are held for a pending job, so only preemption can free anything there.
     """
     if not server.accepts_jobs:
         return Resources(), Resources()
-    free_gpus = max(server.gpu.num - server.gpu.occupied(), 0)
-    now = Resources(
-        gpus=free_gpus,
-        cpus=server.cpu.idle,
-        mem_gb=int(server.mem.idle / 1024),
+    free_gpus = 0 if server.planned else max(server.gpu.num - server.gpu.occupied(), 0)
+    now = (
+        Resources()
+        if server.planned
+        else Resources(
+            gpus=free_gpus,
+            cpus=server.cpu.idle,
+            mem_gb=int(server.mem.idle / 1024),
+        )
     )
     gpus = cpus = mem_gb = shards = 0.0
     for allocation in server.allocations.values():
@@ -115,7 +120,7 @@ def obtainable(
         gpus += math.ceil(shards / server.gpu.shards_per_gpu)
     preempting = Resources(
         gpus=min(free_gpus + round(gpus), server.gpu.num),
-        cpus=min(server.cpu.idle + round(cpus), server.cpu.total),
-        mem_gb=int(min(server.mem.idle / 1024 + mem_gb, server.mem.total / 1024)),
+        cpus=min(now.cpus + round(cpus), server.cpu.total),
+        mem_gb=int(min(now.mem_gb + mem_gb, server.mem.total / 1024)),
     )
     return now, preempting

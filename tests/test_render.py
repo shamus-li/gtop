@@ -33,7 +33,7 @@ from gtop.render_jobs import render_jobs_view
 
 WIDTHS = (80, 100, 160)
 NODE_WIDTHS = (40, *WIDTHS)
-JOB_WIDTHS = (60, *WIDTHS)
+JOB_WIDTHS = (40, 60, *WIDTHS)
 GPU_TYPE = "Pro 6000 Blackwell Server Edition Extra Identifier"
 NODE_NAME = "research-gpu-node-with-stable-id-001"
 USER = "researcher_with_stable_identifier"
@@ -55,6 +55,8 @@ def _server() -> ServerState:
         gpu=GpuInfo(type=GPU_TYPE, num=4, used=1),
         cpu=CpuInfo(idle=32, total=40),
         mem=MemoryInfo(idle=32768, total=65536),
+        state="mixed",
+        reason="",
     )
     server.usage["gpu"] = ResourceUsageSplit(partitions={"priority": 1})
     server.usage["cpu"] = ResourceUsageSplit(partitions={"priority": 8})
@@ -291,18 +293,24 @@ def test_jobs_preserve_identifiers_and_primary_counts(width: int):
 
     output = stream.getvalue()
     _assert_bounded(output, width)
-    assert NODE_NAME in output
-    assert GPU_TYPE in output
-    if width in {60, 160}:
-        assert USER in output
-    else:
-        assert USER.split("_", 1)[0] in output
     assert job.job_id in output
     assert "1/4 GPUs used" in output
-    if width == 160:
+    if width == 40:
+        assert "ID: " in output
+        return
+    assert NODE_NAME in output
+    assert job.time_limit in output
+    assert "ID:" not in output
+    if width == 60:
+        assert "GPU Type" not in output
+    elif width < 160:
+        assert "Pro 6000 Blackwell" in output
+    else:
+        assert GPU_TYPE in output
+        assert USER in output
         assert "·" in next(line for line in output.splitlines() if "GPUs used" in line)
-    assert "8" in output
-    assert "32G" in output
+    if width >= 80:
+        assert "32G" in output
     if width == 80:
         header = next(line for line in output.splitlines() if line.startswith("ID "))
         assert header.split() == [
@@ -316,9 +324,7 @@ def test_jobs_preserve_identifiers_and_primary_counts(width: int):
             "Time",
             "Name",
         ]
-        assert "ID:" not in output
-        assert "GPU/CPU/MEM:" not in output
-    if width >= 80:
+    if width == 160:
         assert "…" not in output
 
 
@@ -335,6 +341,8 @@ def test_job_header_uses_only_scoped_node_allocations():
             gpu=GpuInfo(type="a100", num=4),
             cpu=CpuInfo(total=8),
             mem=MemoryInfo(total=64),
+            state="mixed",
+            reason="",
         )
         for name in ("node-1", "node-2")
     }
@@ -365,6 +373,8 @@ def test_job_header_converts_each_sharded_node_at_its_own_rate():
             gpu=GpuInfo(type="Shard(a)", num=2, shards=200),
             cpu=CpuInfo(),
             mem=MemoryInfo(),
+            state="mixed",
+            reason="",
         ),
         "node-2": ServerState(
             name="node-2",
@@ -372,6 +382,8 @@ def test_job_header_converts_each_sharded_node_at_its_own_rate():
             gpu=GpuInfo(type="Shard(b)", num=2, shards=400),
             cpu=CpuInfo(),
             mem=MemoryInfo(),
+            state="mixed",
+            reason="",
         ),
     }
     process_jobs([job], servers)
@@ -391,11 +403,11 @@ def test_free_gpus_need_4_cpus_and_16g_ram_on_the_node():
         "\n".join(
             [
                 # One job can take all 6 GPUs with 4 CPUs and 16G.
-                "roomy|gpu-high|gpu:a100:6(S:0)|gpu:a100:0(IDX:N/A)|60/4/0/64|495616|512000",
+                "roomy|gpu-high|gpu:a100:6(S:0)|gpu:a100:0(IDX:N/A)|60/4/0/64|495616|512000|mixed|none",
                 # Idle GPUs, but only 3 CPUs free.
-                "cpu-bound|gpu-high|gpu:a100:2(S:0)|gpu:a100:0(IDX:N/A)|61/3/0/64|0|512000",
+                "cpu-bound|gpu-high|gpu:a100:2(S:0)|gpu:a100:0(IDX:N/A)|61/3/0/64|0|512000|mixed|none",
                 # Idle GPUs, but only 10G RAM free.
-                "mem-bound|gpu-high|gpu:h100:4(S:0)|gpu:h100:0(IDX:N/A)|0/64/0/64|501760|512000",
+                "mem-bound|gpu-high|gpu:h100:4(S:0)|gpu:h100:0(IDX:N/A)|0/64/0/64|501760|512000|mixed|none",
             ]
         )
     )

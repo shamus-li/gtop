@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Any, Collection, Mapping, Optional, Sequence
 
-from rich.cells import cell_len
+from rich.cells import cell_len, chop_cells
 from rich.console import (
     Console,
     ConsoleOptions,
@@ -24,12 +24,11 @@ from .render import (
     _data_table,
     _detail_policy,
     _display_gpu_type,
-    _fits_width,
     _max_width,
     _partition_color,
     _pluralize,
 )
-from .slurm import parse_nodelist
+from .slurm import array_task_count, parse_nodelist
 
 
 def _job_state_label(state: str) -> str:
@@ -102,7 +101,11 @@ def _job_assignment(job: JobRecord) -> str:
 
 def build_jobs_overview(jobs: Sequence[JobRecord], *, title: str) -> Text:
     running = sum(1 for job in jobs if job.state.upper().startswith("RUN"))
-    pending = sum(1 for job in jobs if job.state.upper().startswith("PEND"))
+    pending = sum(
+        array_task_count(job.job_id)
+        for job in jobs
+        if job.state.upper().startswith("PEND")
+    )
     requeued = sum(1 for job in jobs if job.state.upper().startswith("REQ"))
 
     line = Text()
@@ -229,50 +232,82 @@ def _capacity_value(group: _JobGroup) -> Text:
 class _PlainTable:
     """Lays out rows like a borderless rich Table without per-cell rendering.
 
-    A cell is a ``(value, style)`` pair, which wraps when its column collapses,
-    or a multi-style ``Text`` in a column that never collapses.
+    A cell is a ``(value, style)`` pair or a multi-style ``Text`` in a column
+    that never shrinks. When rows are too wide, ``shrink`` columns narrow down
+    to their minimum widths, wrapping or, for ``ellipsize`` columns, truncating
+    with an ellipsis. If that is not enough, ``drop`` columns are
+    removed in order.
     """
 
     headers: Sequence[str]
     rows: Sequence[Sequence[Text | tuple[str, str]]]
     right: Collection[str] = ()
-    wrap: Collection[str] = ()
+    shrink: Collection[str] = ()
+    ellipsize: Collection[str] = ()
+    drop: Sequence[str] = ()
     min_widths: Mapping[str, int] = field(default_factory=dict)
+
+    @cached_property
+    def _natural_widths(self) -> list[int]:
+        return [
+            max([len(header), *(_cell_width(row[index]) for row in self.rows)])
+            for index, header in enumerate(self.headers)
+        ]
+
+    def _layout(self, max_width: int) -> Optional[tuple[list[int], list[int]]]:
+        """Returns the kept column indexes and their widths with padding."""
+        kept = list(range(len(self.headers)))
+        for dropped in (None, *self.drop):
+            if dropped is not None:
+                kept.remove(self.headers.index(dropped))
+            pads = [int(position < len(kept) - 1) for position in range(len(kept))]
+            widths = [self._natural_widths[index] + pad for index, pad in zip(kept, pads)]
+            minimums = [
+                min(
+                    self.min_widths.get(self.headers[index], len(self.headers[index])),
+                    self._natural_widths[index],
+                )
+                + pad
+                if self.headers[index] in self.shrink
+                else width
+                for index, pad, width in zip(kept, pads, widths)
+            ]
+            if sum(minimums) > max_width:
+                continue
+            # Narrow the widest shrinkable column first, as rich's Table does.
+            for _ in range(sum(widths) - max_width):
+                position = max(
+                    (
+                        position
+                        for position, minimum in enumerate(minimums)
+                        if widths[position] > minimum
+                    ),
+                    key=lambda position: widths[position],
+                )
+                widths[position] -= 1
+            return kept, widths
+        return None
+
+    def fits(self, width: Optional[int]) -> bool:
+        return width is None or self._layout(width) is not None
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
-        max_width = options.max_width
-        rows = [[(header, "bold white") for header in self.headers], *self.rows]
-        cell_widths = [[_cell_width(cell) for cell in row] for row in rows]
-        last = len(self.headers) - 1
-        pads = [int(index < last) for index in range(len(self.headers))]
-        minimums = [
-            self.min_widths.get(header, len(header)) + pad
-            for header, pad in zip(self.headers, pads)
+        layout = self._layout(options.max_width)
+        assert layout is not None
+        kept, widths = layout
+        headers = [self.headers[index] for index in kept]
+        rows = [
+            [(header, "bold white") for header in headers],
+            *([row[index] for index in kept] for row in self.rows),
         ]
-        widths = [
-            max(min(max(column) + pad, max_width), minimum)
-            for column, pad, minimum in zip(zip(*cell_widths), pads, minimums)
-        ]
-        if sum(widths) > max_width:
-            # Shrink wrappable columns the same way rich's Table does.
-            widths = [
-                max(width, minimum)
-                for width, minimum in zip(
-                    Table._collapse_widths(
-                        widths,
-                        [header in self.wrap for header in self.headers],
-                        max_width,
-                    ),
-                    minimums,
-                )
-            ]
-
+        pads = [int(position < len(kept) - 1) for position in range(len(kept))]
         content_widths = [width - pad for width, pad in zip(widths, pads)]
-        rights = [header in self.right for header in self.headers]
+        rights = [header in self.right for header in headers]
+        ellipsized = [header in self.ellipsize for header in headers]
         styles: dict[str, Style] = {}
-        wrapped: dict[tuple[str, int, bool], list[str]] = {}
+        fitted: dict[tuple[str, int, bool, bool], list[str]] = {}
         # rich styles header padding with the header style.
         header_gaps = [
             (Segment(" ", console.get_style("bold white")),) if pad else ()
@@ -280,13 +315,11 @@ class _PlainTable:
         ]
         gaps = [(Segment(" "),) if pad else () for pad in pads]
         new_line = Segment.line()
-        for row_index, (row, row_widths) in enumerate(zip(rows, cell_widths)):
+        for row_index, row in enumerate(rows):
             cells = [
-                _cell_lines(
-                    console, styles, wrapped, cell, cell_width, width, right
-                )
-                for cell, cell_width, width, right in zip(
-                    row, row_widths, content_widths, rights
+                _cell_lines(console, styles, fitted, cell, width, right, ellipsis)
+                for cell, width, right, ellipsis in zip(
+                    row, content_widths, rights, ellipsized
                 )
             ]
             row_gaps = header_gaps if row_index == 0 else gaps
@@ -307,12 +340,13 @@ def _cell_width(cell: Text | tuple[str, str]) -> int:
 def _cell_lines(
     console: Console,
     styles: dict[str, Style],
-    wrapped: dict[tuple[str, int, bool], list[str]],
+    fitted: dict[tuple[str, int, bool, bool], list[str]],
     cell: Text | tuple[str, str],
-    cell_width: int,
     width: int,
     right: bool,
+    ellipsis: bool,
 ) -> Sequence[Sequence[Segment]]:
+    cell_width = _cell_width(cell)
     if isinstance(cell, Text):
         style = console.get_style(cell.style)
         padding = Segment(" " * (width - cell_width), style)
@@ -323,18 +357,24 @@ def _cell_lines(
     if style is None:
         style = styles[style_name] = console.get_style(style_name)
     if cell_width > width:
-        key = (value, width, right)
-        lines = wrapped.get(key)
+        key = (value, width, right, ellipsis)
+        lines = fitted.get(key)
         if lines is None:
-            lines = wrapped[key] = [
-                line.plain
-                for line in Text(value).wrap(
-                    console,
-                    width,
-                    justify="right" if right else "left",
-                    overflow="fold",
-                )
-            ]
+            if ellipsis:
+                text = Text(value)
+                text.truncate(width, overflow="ellipsis")
+                lines = [text.plain]
+            else:
+                lines = [
+                    line.plain
+                    for line in Text(value).wrap(
+                        console,
+                        width,
+                        justify="right" if right else "left",
+                        overflow="fold",
+                    )
+                ]
+            fitted[key] = lines
         return [(Segment(line, style),) for line in lines]
     padding = " " * (width - cell_width)
     return ((Segment(padding + value if right else value + padding, style),),)
@@ -361,21 +401,6 @@ def _capacity_table(
         bar_widths=[TOP_USER_BAR_WIDTH + 2],
         split_widths=[split_width],
     )
-
-    if not _fits_width(width, required_widths):
-        table = _data_table(show_header=True)
-        table.add_column("Node / GPU capacity", header_style="bold white")
-        for group, capacity, jobs_label in zip(groups, capacities, job_labels):
-            card = Text(group.assignment, style="bold cyan")
-            if group.gpu_type != "-":
-                card.append("\n")
-                card.append(group.gpu_type, style="white")
-            card.append("\n")
-            card.append_text(capacity)
-            card.append("  ")
-            card.append(jobs_label, style="white")
-            table.add_row(card)
-        return table
 
     headers = ["Node", "GPU Type", "Capacity"]
     if include_bar:
@@ -404,7 +429,29 @@ def _capacity_table(
             row.append(split)
         row.append((jobs_label, "white"))
         rows.append(row)
-    return _PlainTable(headers, rows)
+    plain_table = _PlainTable(
+        headers,
+        rows,
+        shrink={"GPU Type"},
+        ellipsize={"GPU Type"},
+        drop=["GPU Type"],
+    )
+    if plain_table.fits(width):
+        return plain_table
+
+    table = _data_table(show_header=True)
+    table.add_column("Node / GPU capacity", header_style="bold white")
+    for group, capacity, jobs_label in zip(groups, capacities, job_labels):
+        card = Text(group.assignment, style="bold cyan")
+        if group.gpu_type != "-":
+            card.append("\n")
+            card.append(group.gpu_type, style="white")
+        card.append("\n")
+        card.append_text(capacity)
+        card.append("  ")
+        card.append(jobs_label, style="white")
+        table.add_row(card)
+    return table
 
 
 _DETAIL_HEADERS = (
@@ -454,34 +501,57 @@ def _job_rows(
 
 @dataclass(frozen=True)
 class _JobCards:
+    """Packs each job's labeled fields onto as few lines as the width allows.
+
+    A field moves whole to an indented continuation line, and only a field
+    wider than a line folds.
+    """
+
     rows: Sequence[tuple[str, ...]]
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
+        max_width = options.max_width
         label_style = console.get_style("bold white")
         styles: dict[str, Style] = {}
         new_line = Segment.line()
-        for row_index, row in enumerate(self.rows):
-            if row_index:
-                yield new_line
+        indent = Segment("  ")
+        for row in self.rows:
             job_id, node, state, user, partition, gpu, cpu, mem, time, name = row
+            position = 0
             for label, value, style_name in (
                 ("ID: ", job_id, "bright_black"),
-                ("Node: ", node, "white"),
-                ("Partition: ", partition, _partition_color(partition)),
                 ("State: ", state, _job_state_style(state)),
                 ("User: ", user, "cyan"),
                 ("Time: ", time, "white"),
-                ("Name: ", name, "white"),
+                ("Node: ", node, "white"),
+                ("Partition: ", partition, _partition_color(partition)),
                 ("GPU/CPU/MEM: ", f"{gpu}/{cpu}/{mem}", "white"),
+                ("Name: ", name, "white"),
             ):
                 style = styles.get(style_name)
                 if style is None:
                     style = styles[style_name] = console.get_style(style_name)
+                field_width = len(label) + cell_len(value)
+                if position and position + 2 + field_width <= max_width:
+                    yield indent
+                    position += 2
+                elif position:
+                    yield new_line
+                    yield indent
+                    position = 2
                 yield Segment(label, label_style)
-                yield Segment(value, style)
-                yield new_line
+                position += len(label)
+                pieces = chop_cells(value, max(max_width - position, 1))
+                for piece_index, piece in enumerate(pieces):
+                    if piece_index:
+                        yield new_line
+                        yield indent
+                        position = 2
+                    yield Segment(piece, style)
+                position += cell_len(pieces[-1])
+            yield new_line
 
 
 def _job_details(
@@ -491,13 +561,6 @@ def _job_details(
     headers = [
         header for header in _DETAIL_HEADERS if show_node or header != "Node"
     ]
-    minimum_widths = [
-        max(len(header), 12 if header == "Name" else 0)
-        for header in headers
-    ]
-    if not _fits_width(width, minimum_widths):
-        return _JobCards(rows)
-
     styled_rows = []
     for row in rows:
         cells = [
@@ -511,13 +574,23 @@ def _job_details(
         if not show_node:
             cells.pop(1)
         styled_rows.append(cells)
-    return _PlainTable(
+    table = _PlainTable(
         headers,
         styled_rows,
         right={"GPU", "CPU", "MEM", "Time"},
-        wrap={"ID", "Node", "User", "Partition", "Time", "Name"},
-        min_widths={"Name": 12},
+        shrink={"ID", "User", "Partition", "Name"},
+        ellipsize={"Name", "Partition"},
+        drop=["CPU", "MEM", "Partition"],
+        # Only pending array ranges like 123_[1-99%5] wrap; job IDs stay whole.
+        min_widths={
+            "ID": max(
+                (len(row[0]) for row in rows if "[" not in row[0]),
+                default=len("ID"),
+            ),
+            "Name": 8,
+        },
     )
+    return table if table.fits(width) else _JobCards(rows)
 
 
 def render_jobs_view(

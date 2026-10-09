@@ -83,6 +83,19 @@ def parse_nodelist(nodelist: str) -> List[str]:
     return [host for node in nodes for host in _expand_host(node)]
 
 
+def array_task_count(job_id: str) -> int:
+    """Tasks in a pending array record such as 123_[1-5,9:2%4]; 1 for any other job."""
+    _, bracket, tasks = job_id.partition("_[")
+    if not bracket:
+        return 1
+    count = 0
+    for item in tasks.rstrip("]").split("%", 1)[0].split(","):
+        span, _, step = item.partition(":")
+        start, _, end = span.partition("-")
+        count += (int(end or start) - int(start)) // int(step or 1) + 1
+    return count
+
+
 def parse_features_field(features: str) -> set[str]:
     if not features:
         return set()
@@ -202,9 +215,11 @@ def parse_jobs(
 def _split_sinfo_line(line: str) -> Optional[List[str]]:
     if not line:
         return None
-    if "|" in line:
+    # sinfo pads every field to its width; shorter "|"-separated lines come from
+    # tests. Length decides, since a drain reason may itself contain "|".
+    if len(line) < sum(SINFO_FIELD_WIDTHS[:-1]):
         parts = [segment.strip() for segment in line.split("|")]
-        return parts if len(parts) == 7 else None
+        return parts if len(parts) == len(SINFO_FIELD_WIDTHS) else None
 
     fields: List[str] = []
     start = 0
@@ -229,9 +244,17 @@ def parse_sinfo(output: str) -> Dict[str, ServerState]:
         if not parts:
             raise ValueError(f"Malformed sinfo record on line {line_number}")
 
-        node_name, features_raw, gres, gres_used, cpu_state, alloc_mem, total_mem = (
-            parts[:7]
-        )
+        (
+            node_name,
+            features_raw,
+            gres,
+            gres_used,
+            cpu_state,
+            alloc_mem,
+            total_mem,
+            state,
+            reason,
+        ) = parts
         if not node_name or not cpu_state or not total_mem:
             raise ValueError(f"Malformed sinfo record on line {line_number}")
 
@@ -253,5 +276,7 @@ def parse_sinfo(output: str) -> Dict[str, ServerState]:
                 gpu=replace(gpu),
                 cpu=replace(cpu),
                 mem=replace(mem),
+                state=state,
+                reason="" if reason == "none" else reason,
             )
     return servers

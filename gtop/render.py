@@ -15,6 +15,7 @@ from .models import (
     ServerState,
     UserUsage,
 )
+from .history import UsageHistory
 from .partitions import SEMANTIC_PARTITIONS, partition_bucket
 
 TOP_USER_BAR_WIDTH = 12
@@ -534,18 +535,17 @@ def print_filtered_users(
 
 
 def print_usage_history(
-    gpu_hours: Mapping[str, float],
-    accounts: Mapping[str, Sequence[str]],
+    history: UsageHistory,
     *,
     title: str,
     limit: int,
     console: Optional[Any] = None,
 ) -> None:
     active_console = console or Console()
-    totals = sorted(gpu_hours.items(), key=lambda item: (-item[1], item[0]))
-    grand_total = sum(gpu_hours.values())
-    top = [(user, total) for user, total in totals[:limit] if round(total) > 0]
-    labs = {user: ",".join(accounts.get(user, ())) for user, _ in top}
+    ranked = history.ranked()
+    grand_total = sum(history.gpu_hours.values())
+    top = ranked[:limit]
+    labs = {user: ",".join(history.accounts.get(user, ())) for user, _ in top}
     include_full_name = _fits_width(
         getattr(active_console, "width", None),
         [
@@ -571,7 +571,7 @@ def print_usage_history(
     active_console.print(
         Text.assemble(
             (title, "bold cyan"),
-            (f"  {round(grand_total):,} GPU-hours, {len(totals)} users", "dim"),
+            (f"  {round(grand_total):,} GPU-hours, {len(ranked)} users", "dim"),
         )
     )
     active_console.print(table)

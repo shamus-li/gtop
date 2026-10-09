@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from .models import JobRecord, ServerState, UserUsage
+from .models import JobRecord, JobUsage, ServerState, UserUsage
 from .render import _display_gpu_type
 
 
@@ -26,53 +26,38 @@ def _capacity(
     }
 
 
-def _partitions(values: dict[str, float]) -> dict[str, int | float]:
+def node_capacity(server: ServerState) -> dict[str, Any]:
     return {
-        partition: _number(amount)
-        for partition, amount in sorted(values.items())
-        if amount > 0
+        "gpu": _capacity(
+            total=server.gpu.num,
+            used=server.gpu.occupied(),
+            unit="GPU",
+            unavailable=0
+            if server.accepts_jobs
+            else server.gpu.num - server.gpu.occupied(),
+        ),
+        "cpu": _capacity(
+            total=server.cpu.total,
+            used=server.cpu.total - server.cpu.idle - server.cpu.other,
+            unit="CPU",
+            unavailable=server.cpu.other
+            + (0 if server.accepts_jobs else server.cpu.idle),
+        ),
+        "memory": _capacity(
+            total=server.mem.total / 1024,
+            used=(server.mem.total - server.mem.idle) / 1024,
+            unit="GiB",
+            unavailable=0 if server.accepts_jobs else server.mem.idle / 1024,
+        ),
     }
 
 
-def summary_json(servers: Sequence[ServerState]) -> dict[str, Any]:
-    unit = "GPU"
-    grouped: dict[str, list[ServerState]] = {}
-    for server in servers:
-        grouped.setdefault(_display_gpu_type(server), []).append(server)
-
-    gpu_types = []
-    total_capacity = 0
-    total_used = 0.0
-    for gpu_type, grouped_servers in sorted(grouped.items()):
-        total = sum(server.gpu.num for server in grouped_servers)
-        partition_totals: dict[str, float] = {}
-        for server in grouped_servers:
-            for partition, amount in server.usage["gpu"].partitions.items():
-                partition_totals[partition] = (
-                    partition_totals.get(partition, 0.0) + amount
-                )
-        used = sum(partition_totals.values())
-        if used <= 0:
-            continue
-        total_capacity += total
-        total_used += used
-
-        gpu_types.append(
-            {
-                "type": gpu_type,
-                "capacity": _capacity(total=total, used=used, unit=unit),
-                "usage": {"partitions": _partitions(partition_totals)},
-            }
-        )
-
+def job_resources(usage: JobUsage) -> dict[str, int | float]:
     return {
-        "view": "summary",
-        "capacity": _capacity(
-            total=total_capacity,
-            used=total_used,
-            unit=unit,
-        ),
-        "gpu_types": gpu_types,
+        "gpu": _number(usage.gpu),
+        "shards": _number(usage.shard),
+        "cpu": _number(usage.cpu),
+        "memory_gib": _number(usage.mem),
     }
 
 
@@ -100,40 +85,20 @@ def nodes_json(servers: Sequence[ServerState]) -> dict[str, Any]:
                 "name": server.name,
                 "gpu_type": _display_gpu_type(server),
                 "accepts_jobs": server.accepts_jobs,
-                "gpu": _capacity(
-                    total=server.gpu.num,
-                    used=server.gpu.occupied(),
-                    unit="GPU",
-                    unavailable=0
-                    if server.accepts_jobs
-                    else server.gpu.num - server.gpu.occupied(),
-                ),
-                "cpu": _capacity(
-                    total=server.cpu.total,
-                    used=server.cpu.total - server.cpu.idle - server.cpu.other,
-                    unit="CPU",
-                    unavailable=server.cpu.other
-                    + (0 if server.accepts_jobs else server.cpu.idle),
-                ),
-                "memory": _capacity(
-                    total=server.mem.total / 1024,
-                    used=(server.mem.total - server.mem.idle) / 1024,
-                    unit="GiB",
-                    unavailable=0 if server.accepts_jobs else server.mem.idle / 1024,
-                ),
+                **node_capacity(server),
                 "usage": {"partitions": partitions},
             }
         )
     return {"view": "nodes", "nodes": nodes}
 
 
-def top_users_json(
+def users_json(
     users: Sequence[UserUsage],
     *,
     unit: str,
 ) -> dict[str, Any]:
     return {
-        "view": "top-users",
+        "view": "users",
         "unit": unit,
         "users": [
             {
@@ -159,12 +124,7 @@ def jobs_json(jobs: Sequence[JobRecord]) -> dict[str, Any]:
                 "state": job.state,
                 "partition": job.partition,
                 "nodelist": job.nodelist,
-                "resources": {
-                    "gpu": _number(job.usage.gpu),
-                    "shards": _number(job.usage.shard),
-                    "cpu": _number(job.usage.cpu),
-                    "memory_gib": _number(job.usage.mem),
-                },
+                "resources": job_resources(job.usage),
                 "time_limit": job.time_limit,
                 "constraints": sorted(job.constraints),
             }

@@ -17,6 +17,8 @@ def make_server(
         gpu=parse_gpu(gpu_gres, gpu_used),
         cpu=CpuInfo(),
         mem=MemoryInfo(),
+        state="mixed",
+        reason="",
     )
 
 

@@ -37,7 +37,7 @@ def test_gpu_and_shard_requests_are_additive():
     servers = parse_sinfo(
         "node-1|gpu|gpu:a40:2,shard:a40:400|"
         "gpu:a40:1(IDX:0),shard:a40:40(0/200,40/200)|"
-        "0/8/0/8|0|65536",
+        "0/8/0/8|0|65536|mixed|none",
     )
     jobs = parse_jobs(sacct_row("cpu=1,gres/gpu=1,gres/shard=40", name="mixed"))
 
@@ -87,7 +87,7 @@ def test_collector_deduplicates_active_jobs_last_record_wins():
         {
             SINFO_COMMAND: result(
                 SINFO_COMMAND,
-                "node-1|gpu|gpu:a100:4|gpu:a100:2(IDX:0-1)|0/8/0/8|0|65536",
+                "node-1|gpu|gpu:a100:4|gpu:a100:2(IDX:0-1)|0/8/0/8|0|65536|mixed|none",
             ),
             SACCT_COMMAND: result(
                 SACCT_COMMAND,
@@ -116,7 +116,7 @@ def test_collector_merges_squeue_jobs_over_sacct_records():
         {
             SINFO_COMMAND: result(
                 SINFO_COMMAND,
-                "node-1|gpu|gpu:a100:4|gpu:a100:1(IDX:0)|0/8/0/8|0|65536",
+                "node-1|gpu|gpu:a100:4|gpu:a100:1(IDX:0)|0/8/0/8|0|65536|mixed|none",
             ),
             SACCT_COMMAND: result(
                 SACCT_COMMAND,
@@ -161,7 +161,7 @@ def test_collector_merges_squeue_jobs_over_sacct_records():
 def test_parse_jobs_canonicalizes_decorated_running_state():
     jobs = parse_jobs(sacct_row("gres/gpu=1", state="RUNNING+"))
     servers = parse_sinfo(
-        "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536",
+        "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536|mixed|none",
     )
 
     process_jobs(jobs, servers)
@@ -215,7 +215,7 @@ def test_parse_jobs_rejects_empty_state():
 def test_parse_sinfo_rejects_any_malformed_nonblank_row():
     output = "\n".join(
         [
-            "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536",
+            "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536|mixed|none",
             "node-2|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0",
         ]
     )
@@ -282,7 +282,7 @@ def test_parse_gpu_rejects_observed_usage_above_capacity(
 
 def test_expanded_sinfo_nodes_do_not_share_gpu_state():
     servers = parse_sinfo(
-        "node-[1-2]|gpu|gpu:a100:2|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
+        "node-[1-2]|gpu|gpu:a100:2|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
     )
 
     assert servers["node-1"].gpu is not servers["node-2"].gpu
@@ -294,8 +294,8 @@ def test_multi_node_user_total_is_conserved_before_rounding():
     servers = parse_sinfo(
         "\n".join(
             [
-                "node-1|gpu|gpu:a100:1|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
-                "node-2|gpu|gpu:a100:1|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536",
+                "node-1|gpu|gpu:a100:1|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
+                "node-2|gpu|gpu:a100:1|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
             ]
         ),
     )
@@ -316,8 +316,8 @@ def test_multi_node_shard_occupancy_is_rounded_once_for_user_total():
     servers = parse_sinfo(
         "\n".join(
             [
-                "node-1|gpu|gpu:a100:1,shard:a100:100|none|0/8/0/8|0|65536",
-                "node-2|gpu|gpu:a100:1,shard:a100:100|none|0/8/0/8|0|65536",
+                "node-1|gpu|gpu:a100:1,shard:a100:100|none|0/8/0/8|0|65536|mixed|none",
+                "node-2|gpu|gpu:a100:1,shard:a100:100|none|0/8/0/8|0|65536|mixed|none",
             ]
         ),
     )

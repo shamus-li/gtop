@@ -14,7 +14,11 @@ from gtop.cli import (
     cli_main,
     main,
 )
-from gtop.collector import CollectionOptions, collect_cluster_state
+from gtop.collector import (
+    CollectionOptions,
+    _sinfo_command_for_partitions,
+    collect_cluster_state,
+)
 from gtop.constants import (
     DEFAULT_TIMEOUT,
     EXIT_COMMAND_ERROR,
@@ -27,10 +31,13 @@ from gtop.constants import (
     SQUEUE_COMMAND,
 )
 from gtop.history import history_command
-from gtop.render_node import node_state_command
 from gtop.runner import Command, CommandResult
 from gtop.scheduling import PARTITION_COMMAND
 from sacct_rows import sacct_row
+
+
+def scoped_sinfo_command(partitions: str) -> Command:
+    return _sinfo_command_for_partitions(SINFO_COMMAND, (partitions,))
 
 
 class FakeRunner:
@@ -79,8 +86,8 @@ def make_result(
 def make_small_cluster_outputs():
     sinfo_output = "\n".join(
         [
-            "node-a|gpu,gpu-high|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
-            "node-b|gpu|gpu:a100:2(S:0)|gpu:a100:2(IDX:0-1)|0/0/0/0|0|0",
+            "node-a|gpu,gpu-high|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+            "node-b|gpu|gpu:a100:2(S:0)|gpu:a100:2(IDX:0-1)|0/0/0/0|0|0|mixed|none",
         ]
     )
     sacct_output = "\n".join(
@@ -134,7 +141,7 @@ def test_collect_cluster_state_rejects_unparseable_sacct_output():
         {
             SINFO_COMMAND: make_result(
                 SINFO_COMMAND,
-                "node-a|gpu|gpu:a100:4|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
             SACCT_COMMAND: make_result(
                 SACCT_COMMAND,
@@ -156,8 +163,8 @@ def test_collect_cluster_state_rejects_unparseable_sacct_output():
 def test_cli_json_output_excludes_cpu_only_nodes():
     sinfo_output = "\n".join(
         [
-            "gpu-node|gpu|gpu:a100:4(S:0-1)|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0",
-            "cpu-node|cpu|(null)|(null)|0/0/0/16|0|0",
+            "gpu-node|gpu|gpu:a100:4(S:0-1)|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
+            "cpu-node|cpu|(null)|(null)|0/0/0/16|0|0|mixed|none",
         ]
     )
     runner = FakeRunner(
@@ -203,7 +210,7 @@ def test_cli_top_users_json_contains_only_ranked_users():
     assert code == EXIT_SUCCESS
     payload = json.loads(stdout.calls[0][0][0])
     assert set(payload) == {"view", "unit", "users"}
-    assert payload["view"] == "top-users"
+    assert payload["view"] == "users"
     assert [(user["rank"], user["user"]) for user in payload["users"]] == [
         (1, "bob"),
         (2, "alice"),
@@ -276,13 +283,13 @@ def test_cli_top_users_includes_shared_partition_usage_on_scoped_nodes():
             sacct_row("billing=8,cpu=8,gres/gpu=2,mem=32G,node=1", user="charlie", job_id="103", partition="cornell", nodelist="node-b"),
         ]
     )
-    partition_sinfo_command = (*SINFO_COMMAND, "-p", "cornell")
+    partition_sinfo_command = scoped_sinfo_command("cornell")
     partition_sacct_command = SACCT_COMMAND
     runner = FakeRunner(
         {
             partition_sinfo_command: make_result(
                 partition_sinfo_command,
-                "node-a|gpu,gpu-high|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu,gpu-high|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
             partition_sacct_command: make_result(
                 partition_sacct_command,
@@ -315,7 +322,7 @@ def test_cli_top_users_includes_shared_partition_usage_on_scoped_nodes():
 
 
 def test_cli_filtered_human_no_match_prints_one_message():
-    sinfo_command = (*SINFO_COMMAND, "-p", "gpu")
+    sinfo_command = scoped_sinfo_command("gpu")
     sacct_command = _sacct_command(
         SACCT_COMMAND,
         states=("RUNNING",),
@@ -325,7 +332,7 @@ def test_cli_filtered_human_no_match_prints_one_message():
         {
             sinfo_command: make_result(
                 sinfo_command,
-                "node-a|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
             ),
             sacct_command: make_result(sacct_command, ""),
         }
@@ -366,7 +373,7 @@ def test_cli_top_users_human_no_match_prints_one_message():
     assert "No users found matching the criteria." in str(stdout.calls[0][0][0])
 
 
-def test_cli_json_no_match_keeps_stdout_empty():
+def test_cli_json_no_match_prints_empty_payload():
     sinfo_output, _ = make_small_cluster_outputs()
     runner = FakeRunner(
         {
@@ -384,8 +391,8 @@ def test_cli_json_no_match_keeps_stdout_empty():
         stderr_console=stderr,
     )
 
-    assert code == EXIT_NO_MATCHES
-    assert stdout.calls == []
+    assert code == EXIT_SUCCESS
+    assert json.loads(stdout.calls[0][0][0]) == {"view": "users", "unit": "GPU", "users": []}
     assert "No users found matching the criteria." in str(stderr.calls[0][0][0])
 
 
@@ -450,7 +457,7 @@ def test_cli_parse_failure_exit_code():
 
 def test_cli_empty_partition_scope_is_a_no_match():
     partition = "missing"
-    sinfo_command = (*SINFO_COMMAND, "-p", partition)
+    sinfo_command = scoped_sinfo_command(partition)
     sacct_command = SACCT_COMMAND
     runner = FakeRunner(
         {
@@ -496,16 +503,14 @@ def test_cli_me_filters_to_current_user():
 
     assert code == EXIT_SUCCESS
     payload = json.loads(stdout.calls[0][0][0])
-    assert payload["view"] == "summary"
-    assert payload["capacity"]["used"] == 1
-    assert payload["gpu_types"][0]["usage"] == {
-        "partitions": {"priority_partition": 1}
-    }
-    assert "target_users" not in json.dumps(payload)
+    assert payload["view"] == "users"
+    assert [(user["user"], user["total"], user["partitions"]) for user in payload["users"]] == [
+        ("alice", 1, {"priority_partition": 1})
+    ]
 
 
 def test_cli_text_and_json_use_sinfo_occupancy_for_availability():
-    sinfo_output = "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:3(IDX:0-2)|0/0/0/0|0|0"
+    sinfo_output = "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:3(IDX:0-2)|0/0/0/0|0|0|mixed|none"
     sacct_output = (
         sacct_row("billing=8,cpu=8,gres/gpu=1,mem=32G,node=1", job_id="101", partition="priority_partition", nodelist="node-a")
     )
@@ -592,8 +597,8 @@ def test_cli_verbose_table_aligns_bars_across_rows(width: int):
 def test_cli_verbose_table_aligns_bars_with_long_names_on_narrow_terminal():
     sinfo_output = "\n".join(
         [
-            "node-with-a-very-long-name-a|gpu|gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition:4(S:0)|gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition:1(IDX:0)|0/0/0/0|0|0",
-            "node-b|gpu|gpu:a100:4(S:0)|gpu:a100:2(IDX:0-1)|0/0/0/0|0|0",
+            "node-with-a-very-long-name-a|gpu|gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition:4(S:0)|gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+            "node-b|gpu|gpu:a100:4(S:0)|gpu:a100:2(IDX:0-1)|0/0/0/0|0|0|mixed|none",
         ]
     )
     sacct_output = "\n".join(
@@ -664,8 +669,8 @@ def test_cli_verbose_shows_node_by_node_breakdown():
 def test_cli_default_text_view_hides_cpu_only_nodes():
     sinfo_output = "\n".join(
         [
-            "gpu-node|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
-            "cpu-node|cpu|(null)|(null)|0/0/0/0|0|0",
+            "gpu-node|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+            "cpu-node|cpu|(null)|(null)|0/0/0/0|0|0|mixed|none",
         ]
     )
     sacct_output = (
@@ -696,11 +701,11 @@ def test_cli_default_text_view_hides_cpu_only_nodes():
 def test_cli_group_headers_sort_by_gpu_capability():
     sinfo_output = "\n".join(
         [
-            "node-t4|gpu|gpu:nvidia_t4:2(S:0)|gpu:nvidia_t4:0(IDX:N/A)|0/0/0/0|0|0",
-            "node-2080|gpu|gpu:nvidia_geforce_rtx_2080_ti:2(S:0)|gpu:nvidia_geforce_rtx_2080_ti:0(IDX:N/A)|0/0/0/0|0|0",
-            "node-a100|gpu|gpu:nvidia_a100:2(S:0)|gpu:nvidia_a100:0(IDX:N/A)|0/0/0/0|0|0",
-            "node-h100|gpu|gpu:nvidia_h100_nvl:2(S:0)|gpu:nvidia_h100_nvl:0(IDX:N/A)|0/0/0/0|0|0",
-            "node-b200|gpu|gpu:nvidia_b200:2(S:0)|gpu:nvidia_b200:0(IDX:N/A)|0/0/0/0|0|0",
+            "node-t4|gpu|gpu:nvidia_t4:2(S:0)|gpu:nvidia_t4:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
+            "node-2080|gpu|gpu:nvidia_geforce_rtx_2080_ti:2(S:0)|gpu:nvidia_geforce_rtx_2080_ti:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
+            "node-a100|gpu|gpu:nvidia_a100:2(S:0)|gpu:nvidia_a100:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
+            "node-h100|gpu|gpu:nvidia_h100_nvl:2(S:0)|gpu:nvidia_h100_nvl:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
+            "node-b200|gpu|gpu:nvidia_b200:2(S:0)|gpu:nvidia_b200:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
         ]
     )
     runner = FakeRunner(
@@ -729,11 +734,11 @@ def test_cli_group_headers_sort_by_gpu_capability():
         )
     ]
     assert group_lines == [
-        next(line for line in group_lines if "T4" in line),
-        next(line for line in group_lines if "RTX 2080 Ti" in line),
-        next(line for line in group_lines if "A100" in line),
-        next(line for line in group_lines if "H100 NVL" in line),
         next(line for line in group_lines if "B200" in line),
+        next(line for line in group_lines if "H100 NVL" in line),
+        next(line for line in group_lines if "A100" in line),
+        next(line for line in group_lines if "RTX 2080 Ti" in line),
+        next(line for line in group_lines if "T4" in line),
     ]
 
 
@@ -761,7 +766,7 @@ def test_cli_top_users_include_full_name_when_available():
 
 
 def test_cli_user_summary_treats_brackets_as_plain_text():
-    sinfo_output = "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0"
+    sinfo_output = "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none"
     sacct_output = (
         sacct_row("billing=8,cpu=8,gres/gpu=1,mem=32G,node=1", user="alice[lab]", job_id="101", partition="priority[queue]", nodelist="node-a")
     )
@@ -853,7 +858,7 @@ def test_cli_filtered_user_view_shows_user_usage_not_cluster_free():
 
 def test_cli_filtered_summary_hides_cpu_only_gpu_nodes():
     sinfo_output = (
-        "node-a|gpu|gpu:a6000:4(S:0)|gpu:a6000:4(IDX:0-3)|0/0/0/0|0|0"
+        "node-a|gpu|gpu:a6000:4(S:0)|gpu:a6000:4(IDX:0-3)|0/0/0/0|0|0|mixed|none"
     )
     sacct_output = (
         sacct_row("billing=16,cpu=16,mem=32G,node=1", job_id="101", nodelist="node-a")
@@ -884,18 +889,13 @@ def test_cli_filtered_summary_hides_cpu_only_gpu_nodes():
     assert "Usage  0 GPUs used" in stream.getvalue()
     assert "GPU Type" not in stream.getvalue()
     assert "A6000" not in stream.getvalue()
-    assert payload["capacity"] == {
-        "free": 0,
-        "total": 0,
-        "unavailable": 0,
-        "unit": "GPU",
-        "used": 0,
-    }
-    assert payload["gpu_types"] == []
+    assert payload["users"] == [
+        {"rank": 1, "user": "alice", "total": 0, "nodes": [], "partitions": {}}
+    ]
 
 
 def test_cli_three_way_partition_split_distinguishes_gpu_partition():
-    sinfo_output = "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0"
+    sinfo_output = "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none"
     sacct_output = (
         sacct_row("billing=8,cpu=8,gres/gpu=1,mem=32G,node=1", job_id="101", nodelist="node-a")
     )
@@ -927,7 +927,7 @@ def test_cli_three_way_partition_split_distinguishes_gpu_partition():
 def test_cli_filtered_user_summary_counts_shard_usage_as_gpu_occupancy():
     sinfo_output = (
         "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|"
-        "gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0"
+        "gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0|mixed|none"
     )
     sacct_output = (
         sacct_row("billing=10,cpu=10,gres/shard:nvidia_gb10=40,gres/shard=40,mem=50G,node=1", job_id="101", partition="spark", nodelist="dgx-spark")
@@ -961,7 +961,7 @@ def test_cli_filtered_user_summary_counts_shard_usage_as_gpu_occupancy():
 def test_cli_filtered_user_summary_does_not_double_count_full_gpu_jobs_on_sharded_nodes():
     sinfo_output = (
         "shard-node|gpu|gpu:nvidia_a40:2(S:1),shard:nvidia_a40:400(S:1)|"
-        "gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:0(0/200)|0/0/0/0|0|0"
+        "gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:0(0/200)|0/0/0/0|0|0|mixed|none"
     )
     sacct_output = (
         sacct_row("billing=8,cpu=8,gres/gpu=1,mem=32G,node=1", job_id="101", nodelist="shard-node")
@@ -985,8 +985,8 @@ def test_cli_filtered_user_summary_does_not_double_count_full_gpu_jobs_on_sharde
 
     assert code == EXIT_SUCCESS
     payload = json.loads(stdout.calls[0][0][0])
-    assert payload["gpu_types"][0]["usage"]["partitions"]["gpu"] == 1
-    assert payload["capacity"]["used"] == 1
+    assert payload["users"][0]["partitions"] == {"gpu": 1}
+    assert payload["users"][0]["total"] == 1
 
 
 def test_cli_filtered_node_view_has_no_jobs_appendix():
@@ -1021,9 +1021,9 @@ def test_cli_filtered_node_view_has_no_jobs_appendix():
 def test_cli_filtered_user_summary_aligns_bars_for_group_totals():
     sinfo_output = "\n".join(
         [
-            "node-a|gpu|gpu:a100:6(S:0)|gpu:a100:5(IDX:0-4)|0/0/0/0|0|0",
-            "node-b|gpu|gpu:a100:6(S:0)|gpu:a100:5(IDX:0-4)|0/0/0/0|0|0",
-            "node-c|gpu|gpu:b200:2(S:0)|gpu:b200:1(IDX:0)|0/0/0/0|0|0",
+            "node-a|gpu|gpu:a100:6(S:0)|gpu:a100:5(IDX:0-4)|0/0/0/0|0|0|mixed|none",
+            "node-b|gpu|gpu:a100:6(S:0)|gpu:a100:5(IDX:0-4)|0/0/0/0|0|0|mixed|none",
+            "node-c|gpu|gpu:b200:2(S:0)|gpu:b200:1(IDX:0)|0/0/0/0|0|0|mixed|none",
         ]
     )
     sacct_output = "\n".join(
@@ -1055,10 +1055,11 @@ def test_cli_filtered_user_summary_aligns_bars_for_group_totals():
     summary_lines = [line for line in output if "A100" in line or "B200" in line]
     assert code == EXIT_SUCCESS
     assert len(summary_lines) == 2
-    assert "10" in summary_lines[0]
-    assert "1" in summary_lines[1]
-    assert "10/12" not in summary_lines[0]
-    assert "1/2" not in summary_lines[1]
+    assert "B200" in summary_lines[0]
+    assert "1" in summary_lines[0]
+    assert "10" in summary_lines[1]
+    assert "1/2" not in summary_lines[0]
+    assert "10/12" not in summary_lines[1]
     assert summary_lines[0].index("[") == summary_lines[1].index("[")
 
 
@@ -1270,7 +1271,7 @@ def test_cli_top_users_includes_shard_only_usage():
             SACCT_COMMAND: make_result(SACCT_COMMAND, sacct_output),
             jobs_sinfo_command: make_result(
                 jobs_sinfo_command,
-                "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0",
+                "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1300,8 +1301,8 @@ def test_cli_top_users_collects_all_nodes_once():
     )
     full_sinfo_output = "\n".join(
         [
-            "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0",
-            "dgx-spark-02|gpu|gpu:nvidia_gb10:1(S:0-1),shard:nvidia_gb10:80(S:0-1)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:20(20/80)|0/0/0/0|0|0",
+            "dgx-spark|gpu|gpu:nvidia_gb10:1(S:0-19),shard:nvidia_gb10:80(S:0-19)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:40(0/80)|0/0/0/0|0|0|mixed|none",
+            "dgx-spark-02|gpu|gpu:nvidia_gb10:1(S:0-1),shard:nvidia_gb10:80(S:0-1)|gpu:nvidia_gb10:0(IDX:N/A),shard:nvidia_gb10:20(20/80)|0/0/0/0|0|0|mixed|none",
         ]
     )
     runner = FakeRunner(
@@ -1334,7 +1335,7 @@ def test_cli_json_output_is_not_wrapped_by_rich_console():
         "gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition:2(S:8-15)|"
         "gpu:nvidia_rtx_6000_ada_generation:2(IDX:4-5),"
         "gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition:0(IDX:N/A)|"
-        "0/0/0/0|0|0"
+        "0/0/0/0|0|0|mixed|none"
     )
     sacct_output = (
         sacct_row("billing=8,cpu=8,gres/gpu=2,mem=32G,node=1", job_id="101", partition="priority_partition", nodelist="node-a")
@@ -1351,7 +1352,7 @@ def test_cli_json_output_is_not_wrapped_by_rich_console():
     console = Console(file=stream, width=40, force_terminal=False)
 
     code = cli_main(
-        ["users", "--json", "--users", "alice"],
+        ["nodes", "--json", "--users", "alice"],
         runner=runner,
         console=console,
         stderr_console=RecordingConsole(),
@@ -1359,7 +1360,7 @@ def test_cli_json_output_is_not_wrapped_by_rich_console():
 
     assert code == EXIT_SUCCESS
     payload = json.loads(stream.getvalue())
-    assert payload["gpu_types"][0]["type"] == ("6000 Ada + Pro 6000 Blackwell Max-Q")
+    assert payload["nodes"][0]["gpu_type"] == "6000 Ada + Pro 6000 Blackwell Max-Q"
 
 
 def make_available_runner(sinfo_command=SINFO_COMMAND):
@@ -1368,9 +1369,9 @@ def make_available_runner(sinfo_command=SINFO_COMMAND):
     # node-c: 2 free H100s, but a default-tier CPU job holds every CPU.
     sinfo_output = "\n".join(
         [
-            "node-a|gpu,gpu-high|gpu:a100:8(S:0)|gpu:a100:6(IDX:0-5)|24/40/0/64|196608|512000",
-            "node-b|gpu,gpu-high|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|0/16/0/16|0|128000",
-            "node-c|gpu,gpu-high|gpu:h100:2(S:0)|gpu:h100:0(IDX:N/A)|8/0/0/8|16384|256000",
+            "node-a|gpu,gpu-high|gpu:a100:8(S:0)|gpu:a100:6(IDX:0-5)|24/40/0/64|196608|512000|mixed|none",
+            "node-b|gpu,gpu-high|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|0/16/0/16|0|128000|mixed|none",
+            "node-c|gpu,gpu-high|gpu:h100:2(S:0)|gpu:h100:0(IDX:N/A)|8/0/0/8|16384|256000|mixed|none",
         ]
     )
     sacct_output = "\n".join(
@@ -1456,11 +1457,51 @@ def test_cli_available_text_table():
         ["A100", "6", "+3", "-"],
         ["gpu"],
         # Strongest GPU type first. node-c's H100s are idle, but a default job
-        # holds every CPU.
-        ["H100", "0", "+2", "2"],
+        # holds every CPU; preempting it frees them, so they are not also Short.
+        ["H100", "0", "+2", "-"],
         ["A100", "6", "+1", "-"],
     ]
     assert not any("default" in line for line in lines)
+
+
+def test_cli_available_planned_node_gpus_are_not_free():
+    runner = make_available_runner()
+    sinfo_output = runner.responses[SINFO_COMMAND].stdout
+    runner.responses[SINFO_COMMAND] = make_result(
+        SINFO_COMMAND, sinfo_output.replace("|128000|mixed|", "|128000|idle-|")
+    )
+    stream = io.StringIO()
+
+    code = run_available(
+        [],
+        console=Console(file=stream, width=160, force_terminal=False),
+        runner=runner,
+    )
+
+    lines = [line.split() for line in stream.getvalue().splitlines()]
+    assert code == EXIT_SUCCESS
+    # node-b's 4 idle A100s are held for a pending job; only node-a's 2 remain.
+    assert lines[1:3] == [["lab"], ["A100", "2", "+3", "-"]]
+
+
+def test_cli_available_draining_node_offers_nothing_to_preempt():
+    runner = make_available_runner()
+    sinfo_output = runner.responses[SINFO_COMMAND].stdout
+    # A draining node's allocated CPUs are not "other", so only its state shows it.
+    runner.responses[SINFO_COMMAND] = make_result(
+        SINFO_COMMAND, sinfo_output.replace("|512000|mixed|", "|512000|draining|")
+    )
+    stream = io.StringIO()
+
+    code = run_available(
+        [],
+        console=Console(file=stream, width=160, force_terminal=False),
+        runner=runner,
+    )
+
+    lines = [line.split() for line in stream.getvalue().splitlines()]
+    assert code == EXIT_SUCCESS
+    assert lines[1:3] == [["lab"], ["A100", "4", "-", "-"]]
 
 
 def test_cli_available_partition_without_lower_jobs_shows_no_preemptible_gpus():
@@ -1469,7 +1510,7 @@ def test_cli_available_partition_without_lower_jobs_shows_no_preemptible_gpus():
     code = run_available(
         ["-p", "default"],
         console=Console(file=stream, width=160, force_terminal=False),
-        runner=make_available_runner((*SINFO_COMMAND, "-p", "default")),
+        runner=make_available_runner(scoped_sinfo_command("default")),
     )
 
     lines = [line.split() for line in stream.getvalue().splitlines()]
@@ -1527,6 +1568,35 @@ def test_cli_users_history_sums_gpu_hours_across_accounts(tmp_path, monkeypatch,
     assert rows == {"alice": ["40", "80%", "gpu-shared,lab"], "bob": ["10", "20%", "other"]}
 
 
+def test_cli_users_history_json_ranks_users_with_usage_up_to_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    command = history_command("week")
+    sreport_output = "\n".join(
+        [
+            "unicorn|alice|Alice A|lab|gres/gpu|30",
+            "unicorn|bob|Bob B|other|gres/gpu|40",
+            "unicorn|carol|Carol C|lab|gres/gpu|20",
+            "unicorn|dave|Dave D|lab|gres/gpu|0.2",
+        ]
+    )
+    stdout = RecordingConsole()
+
+    with patch("gtop.cli.cached_history", return_value=None):
+        code = cli_main(
+            ["users", "--week", "-n", "2", "--json"],
+            runner=FakeRunner({command: make_result(command, sreport_output)}),
+            console=stdout,
+            stderr_console=RecordingConsole(),
+        )
+
+    payload = json.loads(stdout.calls[0][0][0])
+    assert code == EXIT_SUCCESS
+    assert payload["users"] == [
+        {"rank": 1, "user": "bob", "total": 40.0, "accounts": ["other"]},
+        {"rank": 2, "user": "alice", "total": 30.0, "accounts": ["lab"]},
+    ]
+
+
 def test_cli_node_detail_shows_state_partitions_and_jobs():
     runner = make_available_runner((*SINFO_COMMAND, "-n", "node-a"))
     queued = [
@@ -1545,10 +1615,6 @@ def test_cli_node_detail_shows_state_partitions_and_jobs():
     running = runner.responses.pop(SACCT_COMMAND).stdout
     runner.responses[JOBS_SACCT_COMMAND] = make_result(
         JOBS_SACCT_COMMAND, "\n".join([running, *queued])
-    )
-    state_command = node_state_command(["node-a"])
-    runner.responses[state_command] = make_result(
-        state_command, "node-a|mixed|none"
     )
     stream = io.StringIO()
 
@@ -1581,8 +1647,6 @@ def test_cli_node_detail_reports_unknown_node():
     runner.responses[(*SINFO_COMMAND, "-n", "nope")] = make_result(
         (*SINFO_COMMAND, "-n", "nope"), ""
     )
-    state_command = node_state_command(["nope"])
-    runner.responses[state_command] = make_result(state_command, "")
     stream = io.StringIO()
 
     code = cli_main(
@@ -1615,7 +1679,7 @@ def test_cli_jobs_output_includes_job_rows():
             jobs_command: make_result(jobs_command, sacct_output),
             jobs_sinfo_command: make_result(
                 jobs_sinfo_command,
-                "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1654,7 +1718,7 @@ def test_cli_jobs_json_uses_fixed_active_states_and_jobs_shape():
             JOBS_SACCT_COMMAND: make_result(JOBS_SACCT_COMMAND, sacct_output),
             SINFO_COMMAND: make_result(
                 SINFO_COMMAND,
-                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1691,8 +1755,8 @@ def test_cli_jobs_multi_node_headers_show_aggregate_capacity_and_gpu_type():
     jobs_sinfo_command = SINFO_COMMAND
     sinfo_output = "\n".join(
         [
-            "node-1|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
-            "node-2|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+            "node-1|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+            "node-2|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
         ]
     )
     runner = FakeRunner(
@@ -1760,7 +1824,7 @@ def test_cli_jobs_output_uses_compact_parsed_columns():
             jobs_command: make_result(jobs_command, sacct_output),
             jobs_sinfo_command: make_result(
                 jobs_sinfo_command,
-                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1798,7 +1862,7 @@ def test_cli_jobs_output_uses_shard_capacity_for_sharded_nodes():
             jobs_command: make_result(jobs_command, sacct_output),
             jobs_sinfo_command: make_result(
                 jobs_sinfo_command,
-                "dgx-spark|gpu|gpu:gb10:1(S:0),shard:gb10:80(S:0)|gpu:gb10:0(IDX:N/A),shard:gb10:40(0/80)|0/0/0/0|0|0",
+                "dgx-spark|gpu|gpu:gb10:1(S:0),shard:gb10:80(S:0)|gpu:gb10:0(IDX:N/A),shard:gb10:40(0/80)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1831,7 +1895,7 @@ def test_cli_jobs_output_converts_full_gpu_jobs_on_sharded_nodes():
             jobs_command: make_result(jobs_command, sacct_output),
             jobs_sinfo_command: make_result(
                 jobs_sinfo_command,
-                "shard-node|gpu|gpu:nvidia_a40:2(S:1),shard:nvidia_a40:400(S:1)|gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:0(0/200)|0/0/0/0|0|0",
+                "shard-node|gpu|gpu:nvidia_a40:2(S:1),shard:nvidia_a40:400(S:1)|gpu:nvidia_a40:1(IDX:0),shard:nvidia_a40:0(0/200)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1869,9 +1933,9 @@ def test_cli_jobs_mode_filters_partition_and_active_states():
     runner = FakeRunner(
         {
             jobs_command: make_result(jobs_command, sacct_output),
-            (*SINFO_COMMAND, "-p", "monakhova"): make_result(
-                (*SINFO_COMMAND, "-p", "monakhova"),
-                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+            scoped_sinfo_command("monakhova"): make_result(
+                scoped_sinfo_command("monakhova"),
+                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1892,12 +1956,16 @@ def test_cli_jobs_mode_filters_partition_and_active_states():
     assert "done_c" not in output
 
 
-def test_cli_partition_short_flag_parses_multiple_values():
+def test_cli_list_options_take_comma_separated_values_and_leave_node_names():
     parser = build_parser()
 
-    args = parser.parse_args(["jobs", "-p", "monakhova", "gpu"])
+    args = parser.parse_args(
+        ["nodes", "-u", "alice,bob", "-p", "monakhova,gpu", "-C", "nvlink", "node-a"]
+    )
 
+    assert args.users == ["alice", "bob"]
     assert args.partition == ["monakhova", "gpu"]
+    assert args.names == ["node-a"]
 
 
 @pytest.mark.parametrize(
@@ -1931,9 +1999,9 @@ def test_cli_jobs_partition_scope_includes_all_usage_on_nodes(
     runner = FakeRunner(
         {
             jobs_command: make_result(jobs_command, sacct_output),
-            (*SINFO_COMMAND, "-p", "monakhova"): make_result(
-                (*SINFO_COMMAND, "-p", "monakhova"),
-                "monakhova-compute-01|gpu|gpu:a6000:8(S:0)|gpu:a6000:1(IDX:0)|0/0/0/0|0|0",
+            scoped_sinfo_command("monakhova"): make_result(
+                scoped_sinfo_command("monakhova"),
+                "monakhova-compute-01|gpu|gpu:a6000:8(S:0)|gpu:a6000:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -1968,12 +2036,12 @@ def test_cli_jobs_mode_flattens_comma_separated_partitions():
     runner = FakeRunner(
         {
             jobs_command: make_result(jobs_command, sacct_output),
-            (*SINFO_COMMAND, "-p", "monakhova,scavenge"): make_result(
-                (*SINFO_COMMAND, "-p", "monakhova,scavenge"),
+            scoped_sinfo_command("monakhova,scavenge"): make_result(
+                scoped_sinfo_command("monakhova,scavenge"),
                 "\n".join(
                     [
-                        "monakhova-compute-01|gpu|gpu:a6000:8(S:0)|gpu:a6000:1(IDX:0)|0/0/0/0|0|0",
-                        "other-node|gpu|gpu:a40:2(S:0)|gpu:a40:1(IDX:0)|0/0/0/0|0|0",
+                        "monakhova-compute-01|gpu|gpu:a6000:8(S:0)|gpu:a6000:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+                        "other-node|gpu|gpu:a40:2(S:0)|gpu:a40:1(IDX:0)|0/0/0/0|0|0|mixed|none",
                     ]
                 ),
             ),
@@ -2010,9 +2078,9 @@ def test_cli_jobs_mode_partition_filter_avoids_node_substring_false_positive():
     runner = FakeRunner(
         {
             jobs_command: make_result(jobs_command, sacct_output),
-            (*SINFO_COMMAND, "-p", "gpu"): make_result(
-                (*SINFO_COMMAND, "-p", "gpu"),
-                "gpu-node|gpu|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0",
+            scoped_sinfo_command("gpu"): make_result(
+                scoped_sinfo_command("gpu"),
+                "gpu-node|gpu|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -2037,7 +2105,7 @@ def test_cli_jobs_partition_scope_matches_pending_partition_choices():
         states=None,
         users={"alice"},
     )
-    scoped_sinfo = (*SINFO_COMMAND, "-p", "gpu")
+    scoped_sinfo = scoped_sinfo_command("gpu")
     runner = FakeRunner(
         {
             jobs_command: make_result(
@@ -2046,7 +2114,7 @@ def test_cli_jobs_partition_scope_matches_pending_partition_choices():
             ),
             scoped_sinfo: make_result(
                 scoped_sinfo,
-                "node-a|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -2097,8 +2165,8 @@ def test_cli_jobs_mode_uses_shared_collection_pipeline():
                 jobs_sinfo_command,
                 "\n".join(
                     [
-                        "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
-                        "node-b|gpu|gpu:a100:2(S:0)|gpu:a100:2(IDX:0-1)|0/0/0/0|0|0",
+                        "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+                        "node-b|gpu|gpu:a100:2(S:0)|gpu:a100:2(IDX:0-1)|0/0/0/0|0|0|mixed|none",
                     ]
                 ),
             ),
@@ -2137,7 +2205,7 @@ def test_cli_jobs_view_keeps_pending_and_running_rows_in_one_table():
             ),
             SINFO_COMMAND: make_result(
                 SINFO_COMMAND,
-                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4(S:0)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -2168,7 +2236,7 @@ def test_cli_jobs_mode_pushes_user_filter_into_sacct_command():
             jobs_command: make_result(jobs_command, sacct_output),
             jobs_sinfo_command: make_result(
                 jobs_sinfo_command,
-                "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0",
+                "node-a|gpu|gpu:a100:4(S:0-1)|gpu:a100:1(IDX:0)|0/0/0/0|0|0|mixed|none",
             ),
         }
     )
@@ -2199,8 +2267,8 @@ def test_cli_jobs_headers_align_gpu_type_column():
     jobs_sinfo_command = SINFO_COMMAND
     sinfo_output = "\n".join(
         [
-            "n1|gpu|gpu:a40:2(S:0)|gpu:a40:1(IDX:0)|0/0/0/0|0|0",
-            "very-long-node-name|gpu|gpu:b200:8(S:0)|gpu:b200:1(IDX:0)|0/0/0/0|0|0",
+            "n1|gpu|gpu:a40:2(S:0)|gpu:a40:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+            "very-long-node-name|gpu|gpu:b200:8(S:0)|gpu:b200:1(IDX:0)|0/0/0/0|0|0|mixed|none",
         ]
     )
     runner = FakeRunner(
@@ -2237,10 +2305,10 @@ def test_cli_jobs_headers_align_gpu_type_column():
 def test_cli_constraint_requires_every_feature_and_accepts_alternatives():
     sinfo_output = "\n".join(
         [
-            "fast-nv|gpu,ampere,nvlink|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|0/64/0/64|0|512000",
-            "fast|gpu,ampere|gpu:a40:4(S:0)|gpu:a40:0(IDX:N/A)|0/64/0/64|0|512000",
-            "new-nv|gpu,hopper,nvlink|gpu:h100:4(S:0)|gpu:h100:0(IDX:N/A)|0/64/0/64|0|512000",
-            "old-nv|gpu,pascal,nvlink|gpu:p100:4(S:0)|gpu:p100:0(IDX:N/A)|0/64/0/64|0|512000",
+            "fast-nv|gpu,ampere,nvlink|gpu:a100:4(S:0)|gpu:a100:0(IDX:N/A)|0/64/0/64|0|512000|mixed|none",
+            "fast|gpu,ampere|gpu:a40:4(S:0)|gpu:a40:0(IDX:N/A)|0/64/0/64|0|512000|mixed|none",
+            "new-nv|gpu,hopper,nvlink|gpu:h100:4(S:0)|gpu:h100:0(IDX:N/A)|0/64/0/64|0|512000|mixed|none",
+            "old-nv|gpu,pascal,nvlink|gpu:p100:4(S:0)|gpu:p100:0(IDX:N/A)|0/64/0/64|0|512000|mixed|none",
         ]
     )
     runner = FakeRunner(
@@ -2252,7 +2320,7 @@ def test_cli_constraint_requires_every_feature_and_accepts_alternatives():
     stdout = RecordingConsole()
 
     code = cli_main(
-        ["nodes", "-C", "nvlink", "ampere|hopper", "--json"],
+        ["nodes", "-C", "nvlink,ampere|hopper", "--json"],
         runner=runner,
         console=stdout,
         stderr_console=RecordingConsole(),

@@ -53,8 +53,9 @@ def _sinfo_command_for_partitions(
     command: Command,
     partitions: tuple[str, ...],
 ) -> Command:
+    # sinfo rejects -a with -p; named partitions show even if restricted.
     return set_value_option(
-        command,
+        tuple(token for token in command if token not in ("-a", "--all")),
         ("-p", "--partition", "--partitions"),
         ",".join(partitions),
     )
