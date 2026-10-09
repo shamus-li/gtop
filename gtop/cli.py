@@ -172,6 +172,13 @@ def _feature_arg(value: str) -> frozenset[str]:
     return alternatives
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
 def _node_matches(server: ServerState, args: argparse.Namespace) -> bool:
     if args.tier != "all" and f"gpu-{args.tier}" not in server.features:
         return False
@@ -255,6 +262,14 @@ def build_parser() -> argparse.ArgumentParser:
             const=name,
             help=f"GPU-hours over the last {days} days (cached)",
         )
+    users.add_argument(
+        "-n",
+        "--limit",
+        type=_positive_int,
+        default=25,
+        metavar="N",
+        help="Number of users to list (default: 25)",
+    )
     users.add_argument(
         "--refresh",
         action="store_true",
@@ -455,7 +470,7 @@ def cli_main(
                 -max(usage.usage_by_partition.values(), default=0),
                 usage.user,
             ),
-        )[:25]
+        )[: args.limit]
         if not top_users:
             diagnostic_console.print(
                 Text("No users found matching the criteria.", style="yellow")
@@ -670,7 +685,11 @@ def _history_view(
         return EXIT_SUCCESS
     title = f"GPU use, last {args.window}" + _age_label(history.age_seconds())
     print_usage_history(
-        history.gpu_hours, history.accounts, title=title, console=active_console
+        history.gpu_hours,
+        history.accounts,
+        title=title,
+        limit=args.limit,
+        console=active_console,
     )
     return EXIT_SUCCESS
 

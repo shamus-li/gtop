@@ -54,12 +54,14 @@ gtop users
 gtop users --week
 gtop users --month
 gtop users --year
+gtop users -n 50
 ```
 
 Who is using GPUs now, or GPU-hours per user and lab account over the last 7,
 30 or 365 days, from `sreport`. Results are cached. The week and month caches
 refresh in the background (hourly and every 6 hours); the year cache only
-updates when you add `--refresh`, which takes about 80 seconds.
+updates when you add `--refresh`, which takes about 80 seconds. The list shows
+the top 25 users; `-n N` shows N.
 
 ```bash
 gtop jobs

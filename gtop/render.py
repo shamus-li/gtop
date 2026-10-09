@@ -538,8 +538,8 @@ def print_usage_history(
     accounts: Mapping[str, Sequence[str]],
     *,
     title: str,
+    limit: int,
     console: Optional[Any] = None,
-    limit: int = 25,
 ) -> None:
     active_console = console or Console()
     totals = sorted(gpu_hours.items(), key=lambda item: (-item[1], item[0]))

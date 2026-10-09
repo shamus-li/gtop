@@ -213,6 +213,28 @@ def test_cli_top_users_json_contains_only_ranked_users():
     assert "capacity" not in payload
 
 
+def test_cli_top_users_limit_caps_ranked_users():
+    sinfo_output, sacct_output = make_small_cluster_outputs()
+    runner = FakeRunner(
+        {
+            SINFO_COMMAND: make_result(SINFO_COMMAND, sinfo_output),
+            SACCT_COMMAND: make_result(SACCT_COMMAND, sacct_output),
+        }
+    )
+    stdout = RecordingConsole()
+
+    code = cli_main(
+        ["users", "-n", "1", "--json"],
+        runner=runner,
+        console=stdout,
+        stderr_console=RecordingConsole(),
+    )
+
+    assert code == EXIT_SUCCESS
+    payload = json.loads(stdout.calls[0][0][0])
+    assert [user["user"] for user in payload["users"]] == ["bob"]
+
+
 def test_cli_filtered_nodes_json_separates_capacity_from_usage():
     sinfo_output, sacct_output = make_small_cluster_outputs()
     runner = FakeRunner(
