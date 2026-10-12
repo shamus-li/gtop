@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import lru_cache
 import math
 import pwd
 import re
 from typing import Any, Mapping, Optional, Sequence
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, RenderResult
 from rich.table import Table
 from rich.text import Text
 
@@ -534,10 +535,34 @@ def print_filtered_users(
     active_console.print()
 
 
+@dataclass(frozen=True)
+class _Items:
+    """Items on one line, wrapping only between items on a narrow terminal."""
+
+    items: Sequence[Text]
+    separator: str
+    prefix: Text = field(default_factory=Text)
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        line = self.prefix.copy()
+        for index, item in enumerate(self.items):
+            if index:
+                if line.cell_len + len(self.separator) + item.cell_len > options.max_width:
+                    yield line
+                    line = Text()
+                else:
+                    line.append(self.separator)
+            line.append_text(item)
+        yield line
+
+
 def print_usage_history(
     history: UsageHistory,
     *,
     title: str,
+    freshness: Sequence[str],
     limit: int,
     console: Optional[Any] = None,
 ) -> None:
@@ -568,10 +593,12 @@ def print_usage_history(
             Text(f"{total / grand_total:.0%}", style=NODE_COUNT_COLOR),
             Text(labs[user], style=NODE_COUNT_COLOR),
         )
-    active_console.print(
-        Text.assemble(
-            (title, "bold cyan"),
-            (f"  {round(grand_total):,} GPU-hours, {len(ranked)} users", "dim"),
+    active_console.print(Text(title, style="bold cyan"))
+    for parts in (
+        [f"{round(grand_total):,} GPU-hours", f"{len(ranked)} users"],
+        freshness,
+    ):
+        active_console.print(
+            _Items([Text(part, style="dim") for part in parts], separator=" · ")
         )
-    )
     active_console.print(table)

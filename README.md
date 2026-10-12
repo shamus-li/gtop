@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-- A login node where `sinfo` and `sacct` can read the cluster state
+- A login node where `scontrol`, `squeue` and `sacct` can read the cluster state
 
 gtop is built for the Cornell Unicorn cluster, where partitions have priority
 tiers and nodes carry `gpu-high`, `gpu-mid` or `gpu-low` features.
@@ -58,8 +58,9 @@ gtop users -n 50
 ```
 
 Who is using GPUs now, or GPU-hours per user and lab account over the last 7,
-30 or 365 days, from `sreport`. Results are cached. The week and month caches
-refresh in the background (hourly and every 6 hours); the year cache only
+30 or 365 days, from `sreport`. Results are cached. Week and month results are
+at most 15 minutes old: the first run after that queries `sreport` again, which
+takes about 5 seconds for the week and 10 for the month. The year cache only
 updates when you add `--refresh`, which takes about 80 seconds. The list shows
 the top 25 users; `-n N` shows N.
 

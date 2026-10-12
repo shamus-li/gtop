@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import math
 import os
-import re
 import shlex
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +13,7 @@ from typing import Any, Optional, Sequence, Set
 from rich.console import Console
 from rich.text import Text
 
+from .args import parse_args
 from .accounting import (
     project_servers_for_users,
     summarize_users,
@@ -24,17 +25,13 @@ from .collector import (
     NoMatchingServersError,
     collect_cluster_state,
 )
-from .command_options import set_value_option
 from .constants import (
     DEFAULT_TIMEOUT,
     EXIT_COMMAND_ERROR,
     EXIT_NO_MATCHES,
     EXIT_PARSE_ERROR,
     EXIT_SUCCESS,
-    JOBS_SACCT_COMMAND,
-    SACCT_COMMAND,
-    SINFO_COMMAND,
-    SQUEUE_COMMAND,
+    PARTITION_COMMAND,
 )
 from .history import (
     WINDOWS,
@@ -44,9 +41,7 @@ from .history import (
     fetch_history,
 )
 from .models import ClusterState, JobRecord, ServerState, UserUsage
-from .partitions import partition_names
 from .render import (
-    help_legend,
     print_filtered_users,
     print_top_users,
     print_usage_history,
@@ -60,32 +55,14 @@ from .render_node import (
     render_node,
 )
 from .render_ready import availability_json, build_availability, render_availability
-from .runner import Command, CommandRunner, SubprocessRunner
+from .runner import CommandRunner, SubprocessRunner
+from .plan import target_users, view_commands
 from .scheduling import (
-    MIN_JOB_CPUS,
-    MIN_JOB_MEM_GB,
-    PARTITION_COMMAND,
     parse_partitions,
     submittable_partitions,
     user_groups,
 )
 from .slurm import parse_nodelist
-
-GPU_TIERS = ("high", "mid", "low", "all")
-AVAILABLE_HELP = (
-    "gtop columns, per partition you can submit to:\n"
-    f"  Free      idle GPUs on nodes that also have {MIN_JOB_CPUS} CPUs and\n"
-    f"            {MIN_JOB_MEM_GB}G RAM free\n"
-    "  +Preempt  more GPUs by preempting lower-priority jobs\n"
-    "  Short     idle GPUs on nodes without that much CPU or RAM"
-)
-
-
-class GtopArgumentParser(argparse.ArgumentParser):
-    def print_help(self, file: Optional[Any] = None) -> None:
-        super().print_help(file)
-        Console(file=file).print(help_legend())
-
 
 class _StdoutConsole(Console):
     def on_broken_pipe(self) -> None:
@@ -128,26 +105,6 @@ def _write_json_output(payload: Any, console: Optional[Any]) -> None:
         return
 
     console.print(json_text)
-
-
-def _sacct_command(
-    command: Command,
-    *,
-    states: Optional[Sequence[str]],
-    users: Optional[Set[str]] = None,
-) -> Command:
-    updated = set_value_option(
-        command,
-        ("--state", "-s"),
-        ",".join(states) if states is not None else None,
-    )
-    if users:
-        updated = set_value_option(
-            updated,
-            ("--user", "--users"),
-            ",".join(sorted(users)),
-        )
-    return updated
 
 
 def _print_partition_scope(console: Any, partitions: Sequence[str]) -> None:
@@ -193,186 +150,12 @@ def _filtered_jobs(
     )
 
 
-_FEATURE = re.compile(r"[a-z0-9_.:+-]+")
-
-
-def _comma_list(value: str) -> list[str]:
-    names = [name.strip() for name in value.split(",") if name.strip()]
-    if not names:
-        raise argparse.ArgumentTypeError(f"expected comma-separated names, got {value!r}")
-    return names
-
-
-def _feature_arg(value: str) -> list[frozenset[str]]:
-    """A -C value: required features separated by ",", each "a|b" matching either."""
-    groups = [
-        frozenset(part.strip().lower() for part in item.split("|"))
-        for item in _comma_list(value)
-    ]
-    if not all(_FEATURE.fullmatch(part) for group in groups for part in group):
-        raise argparse.ArgumentTypeError(f"invalid feature {value!r}")
-    return groups
-
-
-def _positive_int(value: str) -> int:
-    if not value.isdigit() or int(value) < 1:
-        raise argparse.ArgumentTypeError(f"expected a whole number of at least 1, got {value!r}")
-    return int(value)
-
-
 def _node_matches(server: ServerState, args: argparse.Namespace) -> bool:
     if args.tier != "all" and f"gpu-{args.tier}" not in server.features:
         return False
     return all(
         alternatives & server.features for alternatives in args.constraint or ()
     )
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = GtopArgumentParser(
-        prog="gtop",
-        description="Show live SLURM GPU capacity and usage",
-        epilog=f"{AVAILABLE_HELP}\n\n"
-        "Options for the default view (-t, -C, -p, --json): gtop available -h",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
-
-    common = GtopArgumentParser(add_help=False)
-    common.add_argument(
-        "-p",
-        "--partition",
-        action="extend",
-        type=partition_names,
-        metavar="PARTITION[,...]",
-        help="Limit to nodes in these partitions",
-    )
-    common.add_argument("--json", action="store_true", help="Emit this view as JSON")
-
-    tier = GtopArgumentParser(add_help=False)
-    tier.add_argument(
-        "-t",
-        "--tier",
-        choices=GPU_TIERS,
-        default="all",
-        help="Only nodes with feature gpu-<tier> (default: all)",
-    )
-    tier.add_argument(
-        "-C",
-        "--constraint",
-        action="extend",
-        type=_feature_arg,
-        metavar="FEATURE[,...]",
-        help="Only nodes with every listed feature; a|b matches either "
-        "(e.g. -C 'nvlink,ampere|ada')",
-    )
-
-    users_filter = GtopArgumentParser(add_help=False)
-    selection = users_filter.add_mutually_exclusive_group()
-    selection.add_argument(
-        "-u",
-        "--users",
-        action="extend",
-        type=_comma_list,
-        metavar="USER[,...]",
-        help="Filter by usernames",
-    )
-    selection.add_argument(
-        "-m", "--me", action="store_true", help="Filter to your own usage"
-    )
-
-    commands.add_parser(
-        "available",
-        parents=[tier, common],
-        help="GPUs free now and by preempting (default)",
-        description=AVAILABLE_HELP,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    nodes = commands.add_parser(
-        "nodes",
-        parents=[tier, users_filter, common],
-        help="Every node with free GPU, CPU and memory, or detail for named nodes",
-    )
-    nodes.add_argument(
-        "names",
-        nargs="*",
-        metavar="NODE",
-        help="Show state, partitions and running jobs for these nodes",
-    )
-    users = commands.add_parser(
-        "users",
-        parents=[users_filter, common],
-        help="Who is using GPUs now, or GPU-hours over a past window",
-    )
-    window = users.add_mutually_exclusive_group()
-    for name, days in (("week", 7), ("month", 30), ("year", 365)):
-        window.add_argument(
-            f"--{name}",
-            dest="window",
-            action="store_const",
-            const=name,
-            help=f"GPU-hours over the last {days} days (cached)",
-        )
-    users.add_argument(
-        "-n",
-        "--limit",
-        type=_positive_int,
-        default=25,
-        metavar="N",
-        help="Number of users to list (default: 25)",
-    )
-    users.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Rebuild the --week/--month/--year cache now",
-    )
-    commands.add_parser(
-        "jobs",
-        parents=[users_filter, common],
-        help="Running, pending and requeued jobs",
-    )
-    return parser
-
-
-def _commands_accepting(parser: argparse.ArgumentParser, option: str) -> list[str]:
-    subparsers = next(
-        action
-        for action in parser._actions
-        if isinstance(action, argparse._SubParsersAction)
-    )
-    return [
-        name
-        for name, subparser in subparsers.choices.items()
-        if option in subparser._option_string_actions
-    ]
-
-
-def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    # Options alone run the default view; a mistyped command still reaches argparse.
-    if not arguments or (
-        arguments[0].startswith("-") and arguments[0] not in ("-h", "--help")
-    ):
-        arguments.insert(0, "available")
-    parser = build_parser()
-    args, unknown = parser.parse_known_args(arguments)
-    if unknown:
-        message = f"unrecognized arguments: {' '.join(unknown)}"
-        commands = _commands_accepting(parser, unknown[0])
-        if commands:
-            message += f" ({unknown[0]} works with: " + ", ".join(
-                f"gtop {command}" for command in commands
-            ) + ")"
-        parser.error(message)
-    if getattr(args, "window", None) and (args.users or args.me or args.partition):
-        parser.error("--week/--month/--year cannot be combined with -u, -m or -p")
-    if args.command == "nodes" and args.names and (
-        args.tier != "all" or args.constraint or args.users or args.me or args.partition
-    ):
-        parser.error("node names cannot be combined with -t, -C, -u, -m or -p")
-    if getattr(args, "refresh", False) and not args.window:
-        parser.error("--refresh needs --week, --month or --year")
-    return args
 
 
 def cli_main(
@@ -382,7 +165,18 @@ def cli_main(
     console: Optional[Any] = None,
     stderr_console: Optional[Any] = None,
 ) -> int:
-    args = _parse_args(argv)
+    return run(
+        parse_args(argv), runner=runner, console=console, stderr_console=stderr_console
+    )
+
+
+def run(
+    args: argparse.Namespace,
+    *,
+    runner: Optional[CommandRunner] = None,
+    console: Optional[Any] = None,
+    stderr_console: Optional[Any] = None,
+) -> int:
     active_console = console or _stdout_console()
     active_stderr = stderr_console or Console(stderr=True)
     diagnostic_console = active_stderr if args.json else active_console
@@ -408,52 +202,29 @@ def cli_main(
             stderr_console=active_stderr,
         )
 
-    target_users: Set[str] = set(getattr(args, "users", None) or ())
-    if getattr(args, "me", False):
-        target_users.add(getpass.getuser())
-    target_user_filter: Optional[Set[str]] = target_users or None
+    target_user_filter = target_users(args)
     partition_filter = tuple(dict.fromkeys(args.partition)) if args.partition else None
-
-    if args.command == "jobs":
-        sacct_command = _sacct_command(
-            JOBS_SACCT_COMMAND,
-            states=None,
-            users=target_user_filter,
-        )
-    else:
-        sacct_command = (
-            _sacct_command(
-                SACCT_COMMAND,
-                states=("RUNNING",),
-                users=target_user_filter,
-            )
-            if target_user_filter
-            else SACCT_COMMAND
-        )
-
+    commands = view_commands(args)
+    assert commands is not None
     options = CollectionOptions(
-        sinfo_command=SINFO_COMMAND,
-        sacct_command=sacct_command,
+        sacct_command=commands.sacct,
+        squeue_command=commands.squeue,
         gpu_only=True,
         partition_filter=partition_filter,
         allow_empty_servers=args.command == "jobs",
-        # sacct misses requeued and array-range pending jobs that squeue lists.
-        squeue_command=(
-            set_value_option(
-                SQUEUE_COMMAND,
-                ("-u", "--user"),
-                ",".join(sorted(target_user_filter)) if target_user_filter else None,
-            )
-            if args.command == "jobs"
-            else None
-        ),
     )
 
     try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             partition_result = (
                 executor.submit(active_runner.run, PARTITION_COMMAND, DEFAULT_TIMEOUT)
-                if args.command == "available"
+                if commands.partitions
+                else None
+            )
+            # Group names come from NSS (often LDAP); look them up while slurmctld works.
+            groups_result = (
+                executor.submit(user_groups, getpass.getuser())
+                if args.command == "available" and not partition_filter
                 else None
             )
             state = collect_cluster_state(
@@ -464,6 +235,7 @@ def cli_main(
             partitions_output = (
                 partition_result.result() if partition_result is not None else None
             )
+            groups = groups_result.result() if groups_result is not None else frozenset()
     except CommandExecutionError as error:
         if (
             error.command_name == "sacct"
@@ -500,6 +272,7 @@ def cli_main(
             args,
             state,
             partitions_output=partitions_output.stdout,
+            groups=groups,
             partition_filter=partition_filter,
             console=console,
             active_console=active_console,
@@ -563,7 +336,7 @@ def cli_main(
             nodes_json(display_servers)
             if args.command == "nodes"
             else users_json(
-                [all_users.get(user, UserUsage(user=user)) for user in sorted(target_users)],
+                [all_users.get(user, UserUsage(user=user)) for user in sorted(target_user_filter or ())],
                 unit=unit,
             )
         )
@@ -574,7 +347,7 @@ def cli_main(
         _print_partition_scope(active_console, partition_filter)
     if target_user_filter:
         print_filtered_users(
-            {user: all_users.get(user, UserUsage(user=user)) for user in target_users},
+            {user: all_users.get(user, UserUsage(user=user)) for user in target_user_filter},
             unit=unit,
             console=active_console,
         )
@@ -611,12 +384,11 @@ def _node_detail_view(
     diagnostic_console: Any,
     stderr_console: Any,
 ) -> int:
-    nodelist = ",".join(args.names)
+    commands = view_commands(args)
+    assert commands is not None
     options = CollectionOptions(
-        sinfo_command=(*SINFO_COMMAND, "-n", nodelist),
-        # Pending jobs have no node yet, so fetch the whole active queue.
-        sacct_command=JOBS_SACCT_COMMAND,
-        squeue_command=SQUEUE_COMMAND,
+        sacct_command=commands.sacct,
+        squeue_command=commands.squeue,
         allow_empty_servers=True,
     )
     try:
@@ -678,6 +450,7 @@ def _available_view(
     state: ClusterState,
     *,
     partitions_output: str,
+    groups: frozenset[str],
     partition_filter: Optional[Sequence[str]],
     console: Optional[Any],
     active_console: Any,
@@ -698,9 +471,7 @@ def _available_view(
     else:
         shown = [
             partition
-            for partition in submittable_partitions(
-                partitions, user_groups(getpass.getuser())
-            )
+            for partition in submittable_partitions(partitions, groups)
             if partition.nodes & servers.keys()
         ]
     if not shown:
@@ -764,33 +535,32 @@ def _history_view(
     if args.json:
         _write_json_output(payload, console)
         return EXIT_SUCCESS
-    title = f"GPU use, last {args.window}" + _age_label(args.window, history)
     print_usage_history(
         history,
-        title=title,
+        title=f"GPU use, last {args.window}",
+        freshness=_freshness(args.window, history),
         limit=args.limit,
         console=active_console,
     )
     return EXIT_SUCCESS
 
 
-def _age_label(window: str, history: UsageHistory) -> str:
+def _freshness(window: str, history: UsageHistory) -> list[str]:
     seconds = history.age_seconds()
     minutes = int(seconds // 60)
     if minutes < 1:
-        return ""
-    if minutes < 120:
-        age = f"{minutes} min"
+        updated = "Updated just now"
+    elif minutes < 120:
+        updated = f"Updated {minutes} min ago"
     elif minutes < 48 * 60:
-        age = f"{minutes // 60} h"
+        updated = f"Updated {minutes // 60} h ago"
     else:
-        age = f"{minutes // 1440} days"
+        updated = f"Updated {minutes // 1440} days ago"
     max_age = WINDOWS[window][1]
     if max_age is None:
-        return f" (as of {age} ago; --refresh to update)"
-    if seconds > max_age:
-        return f" (as of {age} ago; updating in the background)"
-    return f" (as of {age} ago)"
+        return [updated, "--refresh to update"]
+    # A run after max_age queries sreport again; cached_history never returns older.
+    return [updated, f"next refresh in {max(math.ceil((max_age - seconds) / 60), 1)} min"]
 
 
 def _jobs_view(
@@ -834,16 +604,3 @@ def _jobs_view(
     for renderable in job_view.renderables:
         active_console.print(renderable, soft_wrap=True)
     return EXIT_SUCCESS
-
-
-def main() -> None:
-    try:
-        raise SystemExit(cli_main())
-    except KeyboardInterrupt:
-        raise SystemExit(130)
-    except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except BrokenPipeError:
-            pass
-        raise SystemExit(EXIT_SUCCESS)

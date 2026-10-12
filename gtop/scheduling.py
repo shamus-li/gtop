@@ -6,16 +6,11 @@ import os
 from dataclasses import dataclass
 from typing import Mapping
 
+from .constants import MIN_JOB_CPUS, MIN_JOB_MEM_GB
 from .models import ServerState
-from .runner import Command
 from .slurm import parse_nodelist
 
-PARTITION_COMMAND: Command = ("scontrol", "show", "partition", "-a", "-o")
 INTERACTIVE_SUFFIX = "-interactive"
-# A node's GPUs count as available when one job could take them all plus this
-# much CPU and RAM on the same node.
-MIN_JOB_CPUS = 4
-MIN_JOB_MEM_GB = 16
 
 
 @dataclass(frozen=True)

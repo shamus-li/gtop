@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-from gtop.constants import SACCT_COMMAND, SINFO_COMMAND, SINFO_FIELD_WIDTHS
+from gtop.constants import NODES_COMMAND, SACCT_COMMAND
 from gtop.accounting import process_jobs, summarize_users
 from gtop.render_cluster import visible_servers
 from gtop.resources import parse_gpu
@@ -15,9 +15,9 @@ from gtop.slurm import (
     expand_range,
     parse_features_field,
     parse_jobs,
-    parse_sinfo,
+    parse_nodes,
 )
-from sacct_rows import sacct_row
+from slurm_rows import node_row, sacct_row
 
 FIXTURE_DIR = Path(__file__).resolve().parent
 
@@ -89,7 +89,7 @@ def test_sinfo_parsing_sample():
     # Sample sinfo line format (space-separated)
     sample_line = "dutta-compute-01 gpu:nvidia_h100_nvl:2(S:12-23),shard:nvidia_h100_nvl:48(S:12-23) gpu:nvidia_h100_nvl:1(IDX:0),shard:nvidia_h100_nvl:0(0/24,0/24) 98/286/0/384 1516436 1547600"
 
-    # Mock the parsing (since we'd need the full parse_sinfo function)
+    # Mock the parsing (since we'd need the full parse_nodes function)
     parts = sample_line.split()
     if len(parts) >= 6:
         node_name, gres, gres_used = parts[0], parts[1], parts[2]
@@ -100,10 +100,10 @@ def test_sinfo_parsing_sample():
         assert gpu_result.shards == 48
 
 
-def test_parse_sinfo_unicorn_nodes():
+def test_parse_nodes_unicorn_nodes():
     """Ensure unicorn sinfo fixture is parsed correctly."""
 
-    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
+    servers = parse_nodes(read_fixture("nodes-unicorn.txt"))
 
     assert "klara" in servers
     assert servers["klara"].gpu.num == 8
@@ -113,10 +113,8 @@ def test_parse_sinfo_unicorn_nodes():
     assert "gpu-high" in servers["klara"].features
 
 
-def test_parse_sinfo_g2_fixed_width():
-    """g2 sinfo output uses fixed-width columns without whitespace delimiters."""
-
-    servers = parse_sinfo(read_fixture("sinfo-output-g2.txt"))
+def test_parse_nodes_g2():
+    servers = parse_nodes(read_fixture("nodes-g2.txt"))
 
     # Parsing preserves CPU-only nodes; view policy filters them later.
     assert "g2-cpu-28" in servers
@@ -131,8 +129,8 @@ def test_parse_sinfo_g2_fixed_width():
 def test_process_jobs_applies_gpu_usage_split():
     """Processing sacct output should attribute GPU usage to nodes."""
 
-    sinfo = read_fixture("sinfo-output-g2.txt")
-    servers = parse_sinfo(sinfo)
+    sinfo = read_fixture("nodes-g2.txt")
+    servers = parse_nodes(sinfo)
     gtop_output = read_fixture("gtop-output-g2.txt")
 
     process_jobs(parse_jobs(gtop_output), servers)
@@ -160,12 +158,12 @@ def test_parse_features_field_strips_multipliers():
 
 
 def test_visible_servers_preserves_feature_and_free_capacity_order():
-    servers = parse_sinfo(
+    servers = parse_nodes(
         "\n".join(
             [
-                "node-b|gpu-low|gpu:test:2|gpu:test:1(IDX:0)|0/0/0/0|0|0|mixed|none",
-                "node-d|gpu-high|gpu:test:4|gpu:test:3(IDX:0-2)|0/0/0/0|0|0|mixed|none",
-                "node-a|gpu-high|gpu:test:4|gpu:test:1(IDX:0)|0/0/0/0|0|0|mixed|none",
+                node_row("node-b", "gpu:test:2", "gpu:test:1(IDX:0)", features="gpu-low"),
+                node_row("node-d", "gpu:test:4", "gpu:test:3(IDX:0-2)", features="gpu-high"),
+                node_row("node-a", "gpu:test:4", "gpu:test:1(IDX:0)", features="gpu-high"),
             ]
         )
     )
@@ -176,31 +174,25 @@ def test_visible_servers_preserves_feature_and_free_capacity_order():
     ] == ["node-a", "node-d", "node-b"]
 
 
-def test_parse_sinfo_fixed_width_line():
-    fields = [
-        "demo-node",
-        "gpu,gpu-high",
-        "gpu:nvidia_a100:4(S:0-1)",
-        "gpu:nvidia_a100:2(IDX:0-1)",
-        "10/22/0/32",
-        "2048",
-        "65536",
-        "mixed",
-        "none",
-    ]
+def test_parse_nodes_reads_state_partitions_and_a_reason_with_spaces():
+    servers = parse_nodes(
+        "NodeName=demo-node Arch=x86_64 CPUAlloc=10 CPUEfctv=32 CPUTot=32 "
+        "AvailableFeatures=gpu,gpu-high Gres=gpu:nvidia_a100:4(S:0-1) "
+        "GresUsed=gpu:nvidia_a100:2(IDX:0-1) OS=Linux 6.8.0 #139-Ubuntu SMP "
+        "RealMemory=65536 AllocMem=2048 State=MIXED+DRAIN "
+        "Partitions=gpu,lab Reason=disk swap | fan [root@2026-10-09T09:21:17]"
+    )
 
-    segments = [value.ljust(width) for value, width in zip(fields, SINFO_FIELD_WIDTHS)]
-    fixed_width_line = "".join(segments)
-
-    servers = parse_sinfo(fixed_width_line)
-    assert "demo-node" in servers
-    assert servers["demo-node"].gpu.num == 4
-    assert servers["demo-node"].cpu.total == 32
-    assert servers["demo-node"].mem.total == 65536
+    node = servers["demo-node"]
+    assert node.gpu.num == 4
+    assert (node.cpu.idle, node.cpu.other, node.cpu.total) == (0, 22, 32)
+    assert node.partitions == {"gpu", "lab"}
+    assert not node.accepts_jobs
+    assert node.reason == "disk swap | fan [root@2026-10-09T09:21:17]"
 
 
 def test_process_jobs_counts_shard_jobs_as_gpu_occupancy():
-    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
+    servers = parse_nodes(read_fixture("nodes-unicorn.txt"))
     output = sacct_row(
         "billing=8,cpu=8,gres/shard:nvidia_h100_nvl=12,gres/shard=12,mem=64G,node=1",
         job_id="12345",
@@ -237,7 +229,7 @@ def test_parse_jobs_reads_constraints():
 
 
 def test_process_jobs_converts_gpu_usage_to_shards_on_sharded_nodes():
-    servers = parse_sinfo(read_fixture("sinfo-output-unicorn.txt"))
+    servers = parse_nodes(read_fixture("nodes-unicorn.txt"))
     jobs = parse_jobs(
         sacct_row(
             "billing=8,cpu=8,gres/gpu:nvidia_h100_nvl=2,gres/gpu=2,mem=64G,node=1",
@@ -262,11 +254,11 @@ def test_process_jobs_converts_gpu_usage_to_shards_on_sharded_nodes():
 
 
 def test_process_jobs_does_not_reallocate_filtered_nodes():
-    servers = parse_sinfo(
+    servers = parse_nodes(
         "\n".join(
             [
-                "node-1|gpu-high|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
-                "node-2|gpu|gpu:a100:4|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
+                node_row("node-1", "gpu:a100:4", "gpu:a100:0(IDX:N/A)", features="gpu-high", cpus=8, memory=65536),
+                node_row("node-2", "gpu:a100:4", "gpu:a100:0(IDX:N/A)", features="gpu", cpus=8, memory=65536),
             ]
         ),
     )
@@ -278,9 +270,8 @@ def test_process_jobs_does_not_reallocate_filtered_nodes():
     assert servers["node-1"].usage["cpu"].partitions == {"gpu": 4}
 
 
-def test_sinfo_command_requests_per_node_output():
-    assert "-N" in SINFO_COMMAND
-    assert "--exact" in SINFO_COMMAND
+def test_nodes_command_includes_hidden_nodes_and_gres_usage():
+    assert {"-a", "-d"} <= set(NODES_COMMAND)
 
 
 def test_sacct_command_requests_all_users():
@@ -292,24 +283,31 @@ def test_expand_range_preserves_original_width():
     assert expand_range("01-03") == ["01", "02", "03"]
 
 
-def test_stale_year_history_waits_for_refresh_but_week_refreshes(tmp_path, monkeypatch):
+def test_cached_week_history_expires_after_15_minutes_but_year_waits_for_refresh(
+    tmp_path, monkeypatch
+):
     import json
-    from unittest.mock import patch
+    import time
 
     from gtop import history
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    stale = {"generated_at": 0.0, "gpu_hours": {"alice": 1.0}, "accounts": {}}
-    for window in ("week", "year"):
+
+    def write(window: str, age_seconds: float) -> None:
         path = tmp_path / "gtop" / f"usage-{window}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(stale))
+        path.write_text(
+            json.dumps(
+                {"generated_at": time.time() - age_seconds, "gpu_hours": {}, "accounts": {}}
+            )
+        )
 
-    with patch.object(history, "_refresh_in_background") as refresh:
-        assert history.cached_history("year") is not None
-        refresh.assert_not_called()
-        assert history.cached_history("week") is not None
-        refresh.assert_called_once_with("week")
+    write("week", 14 * 60)
+    assert history.cached_history("week") is not None
+    write("week", 16 * 60)
+    assert history.cached_history("week") is None
+    write("year", 30 * 86400)
+    assert history.cached_history("year") is not None
 
 
 @pytest.mark.parametrize(

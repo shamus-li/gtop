@@ -30,6 +30,7 @@ from gtop.render import (
 from gtop.partitions import partition_bucket
 from gtop.render_cluster import _resource_numbers, _resource_row, render_table
 from gtop.render_jobs import render_jobs_view
+from slurm_rows import node_row
 
 WIDTHS = (80, 100, 160)
 NODE_WIDTHS = (40, *WIDTHS)
@@ -57,6 +58,7 @@ def _server() -> ServerState:
         mem=MemoryInfo(idle=32768, total=65536),
         state="mixed",
         reason="",
+        partitions=frozenset(),
     )
     server.usage["gpu"] = ResourceUsageSplit(partitions={"priority": 1})
     server.usage["cpu"] = ResourceUsageSplit(partitions={"priority": 8})
@@ -343,6 +345,7 @@ def test_job_header_uses_only_scoped_node_allocations():
             mem=MemoryInfo(total=64),
             state="mixed",
             reason="",
+            partitions=frozenset(),
         )
         for name in ("node-1", "node-2")
     }
@@ -375,6 +378,7 @@ def test_job_header_converts_each_sharded_node_at_its_own_rate():
             mem=MemoryInfo(),
             state="mixed",
             reason="",
+            partitions=frozenset(),
         ),
         "node-2": ServerState(
             name="node-2",
@@ -384,6 +388,7 @@ def test_job_header_converts_each_sharded_node_at_its_own_rate():
             mem=MemoryInfo(),
             state="mixed",
             reason="",
+            partitions=frozenset(),
         ),
     }
     process_jobs([job], servers)
@@ -397,17 +402,17 @@ def test_job_header_converts_each_sharded_node_at_its_own_rate():
 def test_free_gpus_need_4_cpus_and_16g_ram_on_the_node():
     from gtop.render_ready import build_availability
     from gtop.scheduling import parse_partitions
-    from gtop.slurm import parse_sinfo
+    from gtop.slurm import parse_nodes
 
-    servers = parse_sinfo(
+    servers = parse_nodes(
         "\n".join(
             [
                 # One job can take all 6 GPUs with 4 CPUs and 16G.
-                "roomy|gpu-high|gpu:a100:6(S:0)|gpu:a100:0(IDX:N/A)|60/4/0/64|495616|512000|mixed|none",
+                node_row("roomy", "gpu:a100:6(S:0)", "gpu:a100:0(IDX:N/A)", features="gpu-high", cpus=64, alloc_cpus=60, memory=512000, alloc_mem=495616),
                 # Idle GPUs, but only 3 CPUs free.
-                "cpu-bound|gpu-high|gpu:a100:2(S:0)|gpu:a100:0(IDX:N/A)|61/3/0/64|0|512000|mixed|none",
+                node_row("cpu-bound", "gpu:a100:2(S:0)", "gpu:a100:0(IDX:N/A)", features="gpu-high", cpus=64, alloc_cpus=61, memory=512000),
                 # Idle GPUs, but only 10G RAM free.
-                "mem-bound|gpu-high|gpu:h100:4(S:0)|gpu:h100:0(IDX:N/A)|0/64/0/64|501760|512000|mixed|none",
+                node_row("mem-bound", "gpu:h100:4(S:0)", "gpu:h100:0(IDX:N/A)", features="gpu-high", cpus=64, memory=512000, alloc_mem=501760),
             ]
         )
     )

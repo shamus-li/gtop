@@ -1,8 +1,9 @@
 from subprocess import PIPE, TimeoutExpired
+import time
 from unittest.mock import Mock, patch
 
 from gtop.command_options import set_value_option
-from gtop.runner import SubprocessRunner
+from gtop.runner import PrefetchRunner, SubprocessRunner
 
 
 def test_subprocess_runner_executes_argv_directly():
@@ -67,3 +68,13 @@ def test_set_value_option_removes_option_when_value_is_none():
         ("-p", "--partition", "--partitions"),
         None,
     ) == ("sinfo", "-N", "-h")
+
+
+def test_prefetch_runner_returns_started_results_and_runs_others():
+    runner = PrefetchRunner([("echo", "started"), ("sleep", "30")])
+
+    assert runner.run(("echo", "started"), 5).stdout == "started\n"
+    assert runner.run(("echo", "not started"), 5).stdout == "not started\n"
+    started = time.monotonic()
+    runner.close()  # sleep was never collected, so close() must stop it
+    assert time.monotonic() - started < 5

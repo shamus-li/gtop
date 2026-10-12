@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from typing import Any, Collection, Mapping, Optional, Sequence
@@ -294,7 +295,8 @@ class _PlainTable:
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
-        layout = self._layout(options.max_width)
+        # Too narrow even for minimum widths: print whole lines and let them wrap.
+        layout = self._layout(options.max_width) or self._layout(sys.maxsize)
         assert layout is not None
         kept, widths = layout
         headers = [self.headers[index] for index in kept]

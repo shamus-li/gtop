@@ -82,6 +82,10 @@ class NodeAllocation:
     usage: JobUsage
 
 
+# Node state flags under which slurmctld starts no new jobs on a node.
+UNAVAILABLE_STATES = frozenset({"down", "drain", "fail", "not_responding"})
+
+
 def _default_usage_splits() -> Dict[str, ResourceUsageSplit]:
     return {resource: ResourceUsageSplit() for resource in JOB_RESOURCE_NAMES}
 
@@ -93,24 +97,21 @@ class ServerState:
     gpu: GpuInfo
     cpu: CpuInfo
     mem: MemoryInfo
-    # sinfo's long state, e.g. "mixed", "drained*", "mixed-" (planned).
+    # scontrol's state in lower case, e.g. "mixed", "idle+drain", "mixed+planned".
     state: str
     reason: str
+    partitions: frozenset[str]
     usage: Dict[str, ResourceUsageSplit] = field(default_factory=_default_usage_splits)
     allocations: Dict[str, NodeAllocation] = field(default_factory=dict)
 
     @property
     def accepts_jobs(self) -> bool:
-        """sinfo reports CPUs on down or draining nodes as "other", except the
-        CPUs still allocated on a draining node, so the state is checked too."""
-        return self.cpu.other == 0 and not any(
-            word in self.state for word in ("drain", "down", "fail")
-        )
+        return not UNAVAILABLE_STATES & set(self.state.split("+"))
 
     @property
     def planned(self) -> bool:
-        """Idle resources held for a pending job; sinfo marks the state with "-"."""
-        return self.state.endswith("-")
+        """Idle resources held for a pending job."""
+        return "planned" in self.state.split("+")
 
     def has_target_users(self, target_users: Set[str]) -> bool:
         return any(

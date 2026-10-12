@@ -19,6 +19,7 @@ def make_server(
         mem=MemoryInfo(),
         state="mixed",
         reason="",
+        partitions=frozenset(),
     )
 
 

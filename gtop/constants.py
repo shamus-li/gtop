@@ -1,9 +1,15 @@
 from .runner import Command
 
 DEFAULT_TIMEOUT = 120
+# A node's GPUs count as available when one job could take them all plus this
+# much CPU and RAM on the same node.
+MIN_JOB_CPUS = 4
+MIN_JOB_MEM_GB = 16
+PARTITION_COMMAND: Command = ("scontrol", "show", "partition", "-a", "-o")
 
-# Job names and constraints may contain "|", so sacct fields use a control character.
-SACCT_DELIMITER = "\x01"
+# Job names and constraints may contain "|", so sacct and squeue fields are
+# separated by a control character.
+FIELD_DELIMITER = "\x01"
 # AllocTRES is empty until a job starts; ReqTRES holds what a pending job asked for.
 SACCT_FORMAT = (
     "--format=User,JobID,JobName,State,Partition,NodeList,Constraints,AllocTRES,"
@@ -20,7 +26,7 @@ SACCT_COMMAND: Command = (
     "-X",
     "-n",
     "-P",
-    f"--delimiter={SACCT_DELIMITER}",
+    f"--delimiter={FIELD_DELIMITER}",
     "--state=RUNNING",
     SACCT_FORMAT,
     "--units=G",
@@ -31,7 +37,7 @@ JOBS_SACCT_COMMAND: Command = (
     "-X",
     "-n",
     "-P",
-    f"--delimiter={SACCT_DELIMITER}",
+    f"--delimiter={FIELD_DELIMITER}",
     # A window of "now" returns only active jobs; the default since-midnight
     # window returns every finished job too, and --state=PENDING takes ~40 s.
     "--starttime=now",
@@ -43,7 +49,7 @@ ACTIVE_JOB_STATES = ("RUNNING", "PENDING", "REQUEUED")
 # squeue sees jobs slurmdbd has no current record for (requeued array tasks whose
 # eligible time is in the future, unexpanded pending array ranges), but only the
 # jobs PrivateData lets this user see. Fields match SACCT_FORMAT, in order.
-SQUEUE_FORMAT = f"{SACCT_DELIMITER},".join(
+SQUEUE_FORMAT = f"{FIELD_DELIMITER},".join(
     f"{field}:0"
     for field in (
         "UserName",
@@ -75,18 +81,9 @@ SQUEUE_COMMAND: Command = (
     SQUEUE_FORMAT,
 )
 
-SINFO_COMMAND: Command = (
-    "sinfo",
-    # Without -a, sinfo hides nodes that are only in partitions the user cannot use.
-    "-a",
-    "-N",
-    "-O",
-    "nodehost:100,features:200,gres:256,gresused:256,cpusstate:100,allocmem:100,"
-    "memory:100,statelong:50,reason:300",
-    "--exact",
-    "-h",
-)
-SINFO_FIELD_WIDTHS = (100, 200, 256, 256, 100, 100, 100, 50, 300)
+# One slurmctld request; sinfo makes two (partitions, then nodes) in sequence.
+# -a includes nodes only in partitions this user cannot use; -d adds GresUsed.
+NODES_COMMAND: Command = ("scontrol", "-a", "show", "node", "-o", "-d")
 
 JOB_RESOURCE_NAMES = ("cpu", "gpu", "mem", "shard")
 EXIT_SUCCESS = 0

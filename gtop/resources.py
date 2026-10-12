@@ -182,14 +182,19 @@ def parse_gpu(gres: str, gres_used: str = "") -> GpuInfo:
     )
 
 
-def parse_cpu(cpu_state: str) -> CpuInfo:
-    parts = cpu_state.split("/")
-    if len(parts) != 4 or any(not part.isdigit() for part in parts):
-        raise ValueError(f"Invalid CPU state '{cpu_state}'")
-    allocated, idle, other, total = (int(part) for part in parts)
-    if allocated + idle + other > total:
-        raise ValueError(f"CPU state '{cpu_state}' exceeds total {total}")
-    return CpuInfo(idle=idle, total=total, other=other)
+def parse_cpu(allocated: str, effective: str, total: str, *, available: bool) -> CpuInfo:
+    """CPUs as sinfo counts them: the effective CPUs a node does not have
+    allocated are idle, or "other" when the node cannot take jobs."""
+    if not (allocated.isdigit() and effective.isdigit() and total.isdigit()):
+        raise ValueError(f"Invalid CPU counts {allocated}/{effective}/{total}")
+    spare = int(effective) - int(allocated)
+    if spare < 0 or int(effective) > int(total):
+        raise ValueError(f"CPU counts {allocated}/{effective}/{total} are inconsistent")
+    return CpuInfo(
+        idle=spare if available else 0,
+        total=int(total),
+        other=0 if available else spare,
+    )
 
 
 def _parse_numeric(value: str) -> float:

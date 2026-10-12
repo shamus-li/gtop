@@ -1,25 +1,24 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from .accounting import process_jobs
-from .command_options import set_value_option
 from .constants import (
     ACTIVE_JOB_STATES,
     DEFAULT_TIMEOUT,
     SACCT_COMMAND,
-    SINFO_COMMAND,
+    NODES_COMMAND,
 )
 from .models import ClusterState
 from .partitions import normalize_partition_name, partition_names
-from .runner import Command, CommandResult, CommandRunner, run_commands
-from .slurm import parse_jobs, parse_nodelist, parse_sinfo
+from .runner import Command, CommandResult, CommandRunner, SubprocessRunner
+from .slurm import parse_jobs, parse_nodelist, parse_nodes
 
 
 @dataclass(frozen=True)
 class CollectionOptions:
-    sinfo_command: Command = SINFO_COMMAND
     sacct_command: Command = SACCT_COMMAND
     # Live jobs from slurmctld, merged over sacct's records (squeue wins).
     squeue_command: Optional[Command] = None
@@ -49,18 +48,6 @@ class NoMatchingServersError(GTopError):
     pass
 
 
-def _sinfo_command_for_partitions(
-    command: Command,
-    partitions: tuple[str, ...],
-) -> Command:
-    # sinfo rejects -a with -p; named partitions show even if restricted.
-    return set_value_option(
-        tuple(token for token in command if token not in ("-a", "--all")),
-        ("-p", "--partition", "--partitions"),
-        ",".join(partitions),
-    )
-
-
 def collect_cluster_state(
     *,
     runner: Optional[CommandRunner] = None,
@@ -68,43 +55,55 @@ def collect_cluster_state(
     stderr_console: Optional[Any] = None,
 ) -> ClusterState:
     active_options = options or CollectionOptions()
-    scoped_sinfo_command = (
-        _sinfo_command_for_partitions(
-            active_options.sinfo_command, active_options.partition_filter
-        )
-        if active_options.partition_filter
-        else active_options.sinfo_command
-    )
-    commands = {"sinfo": scoped_sinfo_command, "sacct": active_options.sacct_command}
+    active_runner = runner or SubprocessRunner()
+    commands = {"scontrol": NODES_COMMAND, "sacct": active_options.sacct_command}
     if active_options.squeue_command is not None:
         commands["squeue"] = active_options.squeue_command
-    results = run_commands(
-        commands,
-        timeout=active_options.timeout,
-        runner=runner,
-    )
+    results: dict[str, CommandResult] = {}
+    parsed: dict[str, Any] = {}
+    parse_errors: dict[str, ValueError] = {}
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = {
+            executor.submit(active_runner.run, command, active_options.timeout): name
+            for name, command in commands.items()
+        }
+        # Parse each output as it arrives, while slower commands still run.
+        for future in as_completed(futures):
+            name = futures[future]
+            result = results[name] = future.result()
+            if result.returncode != 0:
+                continue
+            try:
+                parsed[name] = (
+                    parse_nodes(result.stdout)
+                    if name == "scontrol"
+                    else parse_jobs(result.stdout, states=ACTIVE_JOB_STATES)
+                )
+            except ValueError as error:
+                parse_errors[name] = error
+    # Report problems in a fixed order, whatever order the commands finished in.
+    for name in commands:
+        if results[name].returncode != 0:
+            raise CommandExecutionError(name, results[name])
+    for name in commands:
+        if name in parse_errors:
+            raise ClusterParseError(str(parse_errors[name])) from parse_errors[name]
 
-    sinfo_result = results["sinfo"]
-    sacct_result = results["sacct"]
-    if sinfo_result.returncode != 0:
-        raise CommandExecutionError("sinfo", sinfo_result)
-    if sacct_result.returncode != 0:
-        raise CommandExecutionError("sacct", sacct_result)
-    squeue_result = results.get("squeue")
-    if squeue_result is not None and squeue_result.returncode != 0:
-        raise CommandExecutionError("squeue", squeue_result)
-
-    try:
-        servers = parse_sinfo(sinfo_result.stdout)
-    except ValueError as error:
-        raise ClusterParseError(str(error)) from error
+    servers = parsed["scontrol"]
+    if active_options.partition_filter:
+        scope = set(active_options.partition_filter)
+        servers = {
+            name: server
+            for name, server in servers.items()
+            if server.partitions & scope
+        }
     if not servers and not active_options.allow_empty_servers:
         if active_options.partition_filter:
             partitions = ", ".join(active_options.partition_filter)
             raise NoMatchingServersError(
                 f"No servers found in partition scope: {partitions}."
             )
-        raise ClusterParseError("Failed to parse any servers from sinfo output.")
+        raise ClusterParseError("Failed to parse any nodes from scontrol output.")
     if active_options.gpu_only:
         servers = {
             name: server
@@ -114,21 +113,8 @@ def collect_cluster_state(
         if not servers and not active_options.allow_empty_servers:
             raise NoMatchingServersError("No servers found matching the criteria.")
 
-    try:
-        active_jobs_by_id = {
-            job.job_id: job
-            for job in parse_jobs(
-                sacct_result.stdout,
-                states=ACTIVE_JOB_STATES,
-            )
-        }
-        if squeue_result is not None:
-            active_jobs_by_id.update(
-                (job.job_id, job)
-                for job in parse_jobs(squeue_result.stdout, states=ACTIVE_JOB_STATES)
-            )
-    except ValueError as error:
-        raise ClusterParseError(str(error)) from error
+    active_jobs_by_id = {job.job_id: job for job in parsed["sacct"]}
+    active_jobs_by_id.update((job.job_id, job) for job in parsed.get("squeue", ()))
     jobs = list(active_jobs_by_id.values())
     try:
         if active_options.partition_filter:

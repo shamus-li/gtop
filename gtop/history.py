@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,10 +9,10 @@ from typing import Optional
 
 from .runner import Command, CommandRunner, SubprocessRunner
 
-# Window: (days, seconds before a cached result is refreshed in the background).
-# The year query loads slurmdbd for over a minute, so it only refreshes on request.
-WINDOWS = {"week": (7, 3600), "month": (30, 6 * 3600), "year": (365, None)}
-# A background refresh holds its lock at most this long, the sreport timeout.
+# Window: (days, seconds a cached result is shown before the next run refreshes
+# it). The year query loads slurmdbd for over a minute, so it only refreshes on
+# request.
+WINDOWS = {"week": (7, 15 * 60), "month": (30, 15 * 60), "year": (365, None)}
 SREPORT_TIMEOUT = 900
 
 
@@ -122,45 +120,10 @@ def fetch_history(
     return history
 
 
-def _claim_refresh(window: str) -> bool:
-    lock = _cache_path(window).with_suffix(".lock")
-    try:
-        if time.time() - lock.stat().st_mtime < SREPORT_TIMEOUT:
-            return False
-        lock.unlink()
-    except FileNotFoundError:
-        pass
-    try:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        os.close(os.open(lock, os.O_CREAT | os.O_EXCL))
-    except FileExistsError:
-        return False
-    return True
-
-
-def _refresh_in_background(window: str) -> None:
-    if not _claim_refresh(window):
-        return
-    subprocess.Popen(
-        (sys.executable, "-m", "gtop.history", window),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-
 def cached_history(window: str) -> Optional[UsageHistory]:
-    """Return cached history, starting a background refresh when it is stale."""
+    """The cached history, or None when there is none or it is too old to show."""
     history = _read_cache(window)
     max_age = WINDOWS[window][1]
-    if history is not None and max_age is not None and history.age_seconds() > max_age:
-        _refresh_in_background(window)
+    if history is None or (max_age is not None and history.age_seconds() > max_age):
+        return None
     return history
-
-
-if __name__ == "__main__":
-    try:
-        fetch_history(sys.argv[1])
-    finally:
-        _cache_path(sys.argv[1]).with_suffix(".lock").unlink(missing_ok=True)

@@ -14,11 +14,11 @@ from gtop.collector import (
     CollectionOptions,
     collect_cluster_state,
 )
-from gtop.constants import SACCT_COMMAND, SINFO_COMMAND, SQUEUE_COMMAND
+from gtop.constants import SACCT_COMMAND, NODES_COMMAND, SQUEUE_COMMAND
 from gtop.resources import parse_gpu, parse_usage
 from gtop.runner import Command, CommandResult
-from gtop.slurm import parse_jobs, parse_nodelist, parse_sinfo
-from sacct_rows import sacct_row
+from gtop.slurm import parse_jobs, parse_nodelist, parse_nodes
+from slurm_rows import node_row, sacct_row
 
 
 class FakeRunner:
@@ -34,10 +34,8 @@ def result(command: Command, stdout: str) -> CommandResult:
 
 
 def test_gpu_and_shard_requests_are_additive():
-    servers = parse_sinfo(
-        "node-1|gpu|gpu:a40:2,shard:a40:400|"
-        "gpu:a40:1(IDX:0),shard:a40:40(0/200,40/200)|"
-        "0/8/0/8|0|65536|mixed|none",
+    servers = parse_nodes(
+        node_row("node-1", "gpu:a40:2,shard:a40:400", "gpu:a40:1(IDX:0),shard:a40:40(0/200,40/200)", features="gpu", cpus=8, memory=65536),
     )
     jobs = parse_jobs(sacct_row("cpu=1,gres/gpu=1,gres/shard=40", name="mixed"))
 
@@ -85,9 +83,9 @@ def test_parse_jobs_keeps_historical_rows_with_duplicate_job_ids():
 def test_collector_deduplicates_active_jobs_last_record_wins():
     runner = FakeRunner(
         {
-            SINFO_COMMAND: result(
-                SINFO_COMMAND,
-                "node-1|gpu|gpu:a100:4|gpu:a100:2(IDX:0-1)|0/8/0/8|0|65536|mixed|none",
+            NODES_COMMAND: result(
+                NODES_COMMAND,
+                node_row("node-1", "gpu:a100:4", "gpu:a100:2(IDX:0-1)", features="gpu", cpus=8, memory=65536),
             ),
             SACCT_COMMAND: result(
                 SACCT_COMMAND,
@@ -114,9 +112,9 @@ def test_collector_deduplicates_active_jobs_last_record_wins():
 def test_collector_merges_squeue_jobs_over_sacct_records():
     runner = FakeRunner(
         {
-            SINFO_COMMAND: result(
-                SINFO_COMMAND,
-                "node-1|gpu|gpu:a100:4|gpu:a100:1(IDX:0)|0/8/0/8|0|65536|mixed|none",
+            NODES_COMMAND: result(
+                NODES_COMMAND,
+                node_row("node-1", "gpu:a100:4", "gpu:a100:1(IDX:0)", features="gpu", cpus=8, memory=65536),
             ),
             SACCT_COMMAND: result(
                 SACCT_COMMAND,
@@ -160,8 +158,8 @@ def test_collector_merges_squeue_jobs_over_sacct_records():
 
 def test_parse_jobs_canonicalizes_decorated_running_state():
     jobs = parse_jobs(sacct_row("gres/gpu=1", state="RUNNING+"))
-    servers = parse_sinfo(
-        "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536|mixed|none",
+    servers = parse_nodes(
+        node_row("node-1", "gpu:a100:2", "gpu:a100:1(IDX:0)", features="gpu", cpus=8, memory=65536),
     )
 
     process_jobs(jobs, servers)
@@ -212,30 +210,32 @@ def test_parse_jobs_rejects_empty_state():
         parse_jobs(sacct_row("gres/gpu=1", state=""))
 
 
-def test_parse_sinfo_rejects_any_malformed_nonblank_row():
+def test_parse_nodes_rejects_any_malformed_nonblank_row():
     output = "\n".join(
         [
-            "node-1|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0|65536|mixed|none",
-            "node-2|gpu|gpu:a100:2|gpu:a100:1(IDX:0)|0/8/0/8|0",
+            node_row("node-1", "gpu:a100:2", "gpu:a100:1(IDX:0)", features="gpu", cpus=8, memory=65536),
+            "NodeName=node-2 CPUAlloc=0 State=IDLE",
         ]
     )
 
-    with pytest.raises(ValueError, match="Malformed sinfo record on line 2"):
-        parse_sinfo(output)
+    with pytest.raises(ValueError, match="Malformed scontrol node record on line 2"):
+        parse_nodes(output)
 
 
-def test_collector_surfaces_malformed_sinfo_as_cluster_parse_error():
+def test_collector_surfaces_malformed_nodes_as_cluster_parse_error():
     runner = FakeRunner(
         {
-            SINFO_COMMAND: result(
-                SINFO_COMMAND,
-                "node-1|gpu|gpu:a100:2|gpu:a100:1|0/8/0/8|0",
+            NODES_COMMAND: result(
+                NODES_COMMAND,
+                "NodeName=node-1 CPUAlloc=0 State=IDLE",
             ),
             SACCT_COMMAND: result(SACCT_COMMAND, ""),
         }
     )
 
-    with pytest.raises(ClusterParseError, match="Malformed sinfo record on line 1"):
+    with pytest.raises(
+        ClusterParseError, match="Malformed scontrol node record on line 1"
+    ):
         collect_cluster_state(
             runner=runner,
             options=CollectionOptions(),
@@ -280,22 +280,12 @@ def test_parse_gpu_rejects_observed_usage_above_capacity(
         parse_gpu(gres, gres_used)
 
 
-def test_expanded_sinfo_nodes_do_not_share_gpu_state():
-    servers = parse_sinfo(
-        "node-[1-2]|gpu|gpu:a100:2|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
-    )
-
-    assert servers["node-1"].gpu is not servers["node-2"].gpu
-    servers["node-1"].gpu.used = 1
-    assert servers["node-2"].gpu.used == 0
-
-
 def test_multi_node_user_total_is_conserved_before_rounding():
-    servers = parse_sinfo(
+    servers = parse_nodes(
         "\n".join(
             [
-                "node-1|gpu|gpu:a100:1|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
-                "node-2|gpu|gpu:a100:1|gpu:a100:0(IDX:N/A)|0/8/0/8|0|65536|mixed|none",
+                node_row("node-1", "gpu:a100:1", "gpu:a100:0(IDX:N/A)", features="gpu", cpus=8, memory=65536),
+                node_row("node-2", "gpu:a100:1", "gpu:a100:0(IDX:N/A)", features="gpu", cpus=8, memory=65536),
             ]
         ),
     )
@@ -313,11 +303,11 @@ def test_multi_node_user_total_is_conserved_before_rounding():
 
 
 def test_multi_node_shard_occupancy_is_rounded_once_for_user_total():
-    servers = parse_sinfo(
+    servers = parse_nodes(
         "\n".join(
             [
-                "node-1|gpu|gpu:a100:1,shard:a100:100|none|0/8/0/8|0|65536|mixed|none",
-                "node-2|gpu|gpu:a100:1,shard:a100:100|none|0/8/0/8|0|65536|mixed|none",
+                node_row("node-1", "gpu:a100:1,shard:a100:100", "none", features="gpu", cpus=8, memory=65536),
+                node_row("node-2", "gpu:a100:1,shard:a100:100", "none", features="gpu", cpus=8, memory=65536),
             ]
         ),
     )

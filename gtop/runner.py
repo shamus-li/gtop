@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from subprocess import PIPE, Popen, TimeoutExpired
-from typing import Dict, Mapping, Optional, Protocol
+from typing import Iterable, NamedTuple, Protocol, Union
 
 Command = tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class CommandResult:
+class CommandResult(NamedTuple):
     command: Command
     stdout: str
     stderr: str
@@ -21,58 +18,53 @@ class CommandRunner(Protocol):
         ...
 
 
+def _start(command: Command) -> Union[Popen[str], CommandResult]:
+    try:
+        return Popen(command, stdout=PIPE, stderr=PIPE, text=True, encoding="utf-8")
+    except OSError as error:
+        return CommandResult(command, "", str(error), -1)
+
+
+def _finish(
+    started: Union[Popen[str], CommandResult], command: Command, timeout: int
+) -> CommandResult:
+    if isinstance(started, CommandResult):
+        return started
+    try:
+        stdout, stderr = started.communicate(timeout=timeout)
+    except TimeoutExpired:
+        started.kill()
+        stdout, stderr = started.communicate()
+        note = f"Timed out after {timeout} seconds"
+        return CommandResult(command, stdout, f"{stderr}\n{note}" if stderr else note, -1)
+    return CommandResult(command, stdout, stderr, started.returncode)
+
+
 class SubprocessRunner:
     def run(self, command: Command, timeout: int) -> CommandResult:
-        try:
-            process = Popen(
-                command,
-                stdout=PIPE,
-                stderr=PIPE,
-                text=True,
-                encoding="utf-8",
-            )
-            stdout, stderr = process.communicate(timeout=timeout)
-            return CommandResult(
-                command=command,
-                stdout=stdout,
-                stderr=stderr,
-                returncode=process.returncode,
-            )
-        except TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            if stderr:
-                stderr = f"{stderr}\nTimed out after {timeout} seconds"
-            else:
-                stderr = f"Timed out after {timeout} seconds"
-            return CommandResult(
-                command=command,
-                stdout=stdout,
-                stderr=stderr,
-                returncode=-1,
-            )
-        except OSError as error:
-            return CommandResult(
-                command=command,
-                stdout="",
-                stderr=str(error),
-                returncode=-1,
-            )
+        return _finish(_start(command), command, timeout)
 
 
-def run_commands(
-    commands: Mapping[str, Command],
-    *,
-    timeout: int,
-    runner: Optional[CommandRunner] = None,
-) -> Dict[str, CommandResult]:
-    active_runner = runner or SubprocessRunner()
-    results: Dict[str, CommandResult] = {}
-    with ThreadPoolExecutor(max_workers=min(len(commands), 4)) as executor:
-        futures = {
-            executor.submit(active_runner.run, command, timeout): name
-            for name, command in commands.items()
-        }
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    return results
+class PrefetchRunner:
+    """Starts commands as soon as it is created, so they run while gtop loads.
+
+    run() returns a started command's result and runs any other command
+    normally, so a command missing from the prefetch only costs time.
+    """
+
+    def __init__(self, commands: Iterable[Command]):
+        self._started = {command: _start(command) for command in dict.fromkeys(commands)}
+
+    def run(self, command: Command, timeout: int) -> CommandResult:
+        started = self._started.pop(command, None)
+        if started is None:
+            return SubprocessRunner().run(command, timeout)
+        return _finish(started, command, timeout)
+
+    def close(self) -> None:
+        """Stops commands that were started but never collected."""
+        for started in self._started.values():
+            if isinstance(started, Popen):
+                started.kill()
+                started.communicate()
+        self._started.clear()

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from rich.console import Group
+from rich.console import Console, ConsoleOptions, Group, RenderResult
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
@@ -87,7 +88,7 @@ def _resource_numbers(
     """Return (shown count, total, partition usage, occupied, unavailable).
 
     Unavailable is capacity that is neither in use nor schedulable: everything
-    spare on a down or draining node, plus CPUs sinfo reports as "other".
+    spare on a down or draining node, plus CPUs counted as "other".
     """
     partition_amounts = _usage_partitions(server.usage[resource])
     used = int(round(sum(partition_amounts.values())))
@@ -325,7 +326,7 @@ def _cluster_overview(
     *,
     show_used: bool,
     overview_title: str,
-) -> Table:
+) -> Text:
     counts = [
         _resource_numbers(
             server,
@@ -336,11 +337,8 @@ def _cluster_overview(
     ]
     count = sum(item[0] for item in counts)
     total = sum(item[1] for item in counts)
-    table = Table.grid(padding=(0, 2), expand=False)
-    table.add_column(no_wrap=True)
-    table.add_column(no_wrap=True)
-    table.add_row(
-        Text(overview_title, style="bold cyan"),
+    return _title_line(
+        overview_title,
         _capacity_summary(
             count,
             total,
@@ -348,7 +346,10 @@ def _cluster_overview(
             show_used=show_used,
         ),
     )
-    return table
+
+
+def _title_line(title: str, summary: Text) -> Text:
+    return Text.assemble((title, "bold cyan"), "  ", summary, no_wrap=True)
 
 
 def _summary_table(
@@ -548,38 +549,84 @@ def _nodes_table(
                 include_bar = True
                 break
 
-    table = _data_table(show_header=show_header)
-    table.add_column(
-        "Node",
-        header_style="bold white",
-        no_wrap=True,
-        width=node_width,
-    )
+    widths = [node_width]
+    right = [False]
+    headers = ["Node"]
     for resource in resources:
-        _add_resource_columns(
-            table,
-            resource,
-            show_used=show_used,
-            include_bar=include_bar,
-            include_split=include_split,
-            counts_width=count_widths[resource],
-            bar_width=bar_widths[resource] + 2 if include_bar else None,
-            split_width=split_widths[resource] if include_split else None,
+        widths.append(count_widths[resource])
+        right.append(True)
+        headers.append(_resource_header(resource, show_used=show_used))
+        if include_bar:
+            widths.append(bar_widths[resource] + 2)
+            right.append(False)
+            headers.append("")
+        if include_split:
+            widths.append(split_widths[resource])
+            right.append(False)
+            headers.append("")
+    return _FixedRows(
+        widths=widths,
+        right=right,
+        rows=[
+            [
+                Text(server.name, style="bright_black"),
+                *_resource_row(
+                    values,
+                    resources=resources,
+                    show_used=show_used,
+                    show_total=True,
+                    include_bar=include_bar,
+                    include_split=include_split,
+                    bar_widths=bar_widths,
+                ),
+            ]
+            for server, values in rows
+        ],
+        headers=headers if show_header else None,
+    )
+
+
+@dataclass(frozen=True)
+class _FixedRows:
+    """Rows whose column widths are already known, laid out like a borderless
+    rich Table without measuring every cell again (one table per GPU type made
+    that the slowest part of the nodes view)."""
+
+    widths: Sequence[int]
+    right: Sequence[bool]
+    rows: Sequence[Sequence[Text]]
+    headers: Optional[Sequence[str]]
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        # rich's default header style ("bold") applies to unlabeled columns.
+        header = (
+            [
+                [
+                    Text(header, style="bold white" if header else "bold")
+                    for header in self.headers
+                ]
+            ]
+            if self.headers is not None
+            else []
         )
-    for server, values in rows:
-        table.add_row(
-            Text(server.name, style="bright_black"),
-            *_resource_row(
-                values,
-                resources=resources,
-                show_used=show_used,
-                show_total=True,
-                include_bar=include_bar,
-                include_split=include_split,
-                bar_widths=bar_widths,
-            ),
-        )
-    return table
+        for row_index, cells in enumerate([*header, *self.rows]):
+            line = Text(no_wrap=True, overflow="crop", end="")
+            for index, (cell, width, right) in enumerate(
+                zip(cells, self.widths, self.right)
+            ):
+                if index:
+                    # Like rich, a header gap takes the style of the header before it.
+                    gap_style = cells[index - 1].style if header and row_index == 0 else ""
+                    line.append(" ", style=gap_style)
+                padded = cell.copy()
+                padding = max(width - cell.cell_len, 0)
+                if right:
+                    padded.pad_left(padding)
+                else:
+                    padded.pad_right(padding)
+                line.append_text(padded)
+            yield line
+            yield Segment.line()
 
 
 def _group_header(
@@ -587,17 +634,14 @@ def _group_header(
     servers: Sequence[ServerState],
     *,
     show_used: bool,
-) -> Table:
+) -> Text:
     count, total, _, _, _ = _group_resource_numbers(
         servers,
         "gpu",
         show_used=show_used,
     )
-    table = Table.grid(padding=(0, 2), expand=False)
-    table.add_column(no_wrap=True)
-    table.add_column(no_wrap=True)
-    table.add_row(
-        Text(gpu_type, style="bold cyan"),
+    return _title_line(
+        gpu_type,
         _capacity_summary(
             count,
             total,
@@ -605,7 +649,6 @@ def _group_header(
             show_used=show_used,
         ),
     )
-    return table
 
 
 def render_table(

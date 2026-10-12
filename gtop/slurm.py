@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Collection, Dict, List, Optional, Set
+import re
+from typing import Collection, Dict, List, Optional
 
 from .constants import (
-    SACCT_DELIMITER,
+    FIELD_DELIMITER,
     SACCT_FIELD_COUNT,
-    SINFO_FIELD_WIDTHS,
     STALE_RUNNING_GRACE_SECONDS,
 )
 from .constraints import requested_constraint_features
-from .models import JobRecord, ServerState
+from .models import UNAVAILABLE_STATES, JobRecord, ServerState
 from .resources import parse_cpu, parse_gpu, parse_mem, parse_usage
 
 
@@ -161,7 +160,7 @@ def parse_jobs(
     for line_number, line in enumerate(output.splitlines(), start=1):
         if not line.strip():
             continue
-        fields = [field.strip() for field in line.split(SACCT_DELIMITER)]
+        fields = [field.strip() for field in line.split(FIELD_DELIMITER)]
         if len(fields) != SACCT_FIELD_COUNT:
             raise ValueError(f"Malformed sacct record on line {line_number}")
         (
@@ -212,71 +211,45 @@ def parse_jobs(
     return jobs
 
 
-def _split_sinfo_line(line: str) -> Optional[List[str]]:
-    if not line:
-        return None
-    # sinfo pads every field to its width; shorter "|"-separated lines come from
-    # tests. Length decides, since a drain reason may itself contain "|".
-    if len(line) < sum(SINFO_FIELD_WIDTHS[:-1]):
-        parts = [segment.strip() for segment in line.split("|")]
-        return parts if len(parts) == len(SINFO_FIELD_WIDTHS) else None
-
-    fields: List[str] = []
-    start = 0
-    for width in SINFO_FIELD_WIDTHS:
-        end = start + width
-        fields.append(line[start:end].strip())
-        start = end
-    return fields if not line[start:].strip() else None
+_NODE_FIELD = re.compile(r"(?:^|\s)([A-Za-z]+)=(\S*)")
 
 
-def parse_sinfo(output: str) -> Dict[str, ServerState]:
+def parse_nodes(output: str) -> Dict[str, ServerState]:
+    """Nodes from `scontrol show node -o -d`, one "Key=Value ..." line each."""
     servers: Dict[str, ServerState] = {}
-    # sinfo -N repeats each node once per partition with identical fields.
-    seen_lines: Set[str] = set()
-    for line_number, raw_line in enumerate(output.strip().splitlines(), start=1):
-        line = raw_line.rstrip("\n")
-        if not line.strip() or line in seen_lines:
+    for line_number, line in enumerate(output.splitlines(), start=1):
+        if not line.strip():
             continue
-        seen_lines.add(line)
-
-        parts = _split_sinfo_line(line)
-        if not parts:
-            raise ValueError(f"Malformed sinfo record on line {line_number}")
-
-        (
-            node_name,
-            features_raw,
-            gres,
-            gres_used,
-            cpu_state,
-            alloc_mem,
-            total_mem,
-            state,
-            reason,
-        ) = parts
-        if not node_name or not cpu_state or not total_mem:
-            raise ValueError(f"Malformed sinfo record on line {line_number}")
-
+        # Reason is printed last and is the only field read here with spaces.
+        line, _, reason = line.partition(" Reason=")
+        fields = dict(_NODE_FIELD.findall(line))
         try:
-            gpu = parse_gpu(gres, gres_used)
-            cpu = parse_cpu(cpu_state)
-            mem = parse_mem(alloc_mem, total_mem)
-            server_names = parse_nodelist(node_name)
-        except ValueError as error:
-            raise ValueError(
-                f"Malformed sinfo record on line {line_number}: {error}"
-            ) from error
-        if not server_names:
-            raise ValueError(f"Malformed sinfo record on line {line_number}")
-        for server_name in server_names:
-            servers[server_name] = ServerState(
-                name=server_name,
-                features=parse_features_field(features_raw),
-                gpu=replace(gpu),
-                cpu=replace(cpu),
-                mem=replace(mem),
-                state=state,
-                reason="" if reason == "none" else reason,
+            name = fields["NodeName"]
+            state = fields["State"].lower()
+            gpu = parse_gpu(fields.get("Gres", ""), fields.get("GresUsed", ""))
+            cpu = parse_cpu(
+                fields["CPUAlloc"],
+                fields["CPUEfctv"],
+                fields["CPUTot"],
+                available=not UNAVAILABLE_STATES & set(state.split("+")),
             )
+            mem = parse_mem(fields["AllocMem"], fields["RealMemory"])
+        except (KeyError, ValueError) as error:
+            raise ValueError(
+                f"Malformed scontrol node record on line {line_number}: {error}"
+            ) from error
+        servers[name] = ServerState(
+            name=name,
+            features=parse_features_field(fields.get("AvailableFeatures", "")),
+            gpu=gpu,
+            cpu=cpu,
+            mem=mem,
+            state=state,
+            reason=reason.strip(),
+            partitions=frozenset(
+                partition
+                for partition in fields.get("Partitions", "").split(",")
+                if partition
+            ),
+        )
     return servers

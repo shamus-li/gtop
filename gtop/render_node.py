@@ -4,12 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from rich.console import Group
-from rich.table import Table
 from rich.text import Text
 
 from .models import JobRecord, NodeAllocation, ServerState
 from .partitions import partition_names
-from .render import _display_gpu_type
+from .render import _display_gpu_type, _Items, _partition_color
+from .render_jobs import _PlainTable
 from .render_json import job_resources, node_capacity
 from .scheduling import INTERACTIVE_SUFFIX, Partition
 from .slurm import array_task_count
@@ -116,22 +116,31 @@ def render_node(
     used_mem = round((server.mem.total - server.mem.idle) / 1024)
     gpu_type = _display_gpu_type(server) if server.gpu.num else "no GPUs"
     lines: list[Any] = [
-        Text.assemble(
-            (server.name, "bold cyan"),
-            f"  {server.gpu.num}× {gpu_type}  " if server.gpu.num else f"  {gpu_type}  ",
-            (server.state, "green" if server.accepts_jobs else "red"),
+        _Items(
+            [
+                Text(server.name, style="bold cyan"),
+                Text(f"{server.gpu.num}× {gpu_type}" if server.gpu.num else gpu_type),
+                Text(server.state, style="green" if server.accepts_jobs else "red"),
+            ],
+            separator="  ",
         ),
-        Text(
-            f"GPUs {used_gpus}/{server.gpu.num} used · "
-            f"CPUs {used_cpus}/{server.cpu.total} · RAM {used_mem}/{total_mem}G"
+        _Items(
+            [
+                Text(f"GPUs {used_gpus}/{server.gpu.num} used"),
+                Text(f"CPUs {used_cpus}/{server.cpu.total}"),
+                Text(f"RAM {used_mem}/{total_mem}G"),
+            ],
+            separator=" · ",
         ),
-        Text(
-            "Partitions: "
-            + ", ".join(
-                f"{partition.name} ({partition.tier})"
+        _Items(
+            [
+                Text.assemble(
+                    _partition_text(partition.name), (f" ({partition.tier})", "dim")
+                )
                 for partition in _partitions_on(server.name, partitions)
-            ),
-            style="dim",
+            ],
+            separator=", ",
+            prefix=Text("Partitions: ", style="dim"),
         ),
     ]
     if server.reason:
@@ -145,14 +154,19 @@ def render_node(
     return Group(*lines)
 
 
+def _partition_text(name: str) -> Text:
+    return Text(name, style=_partition_color(name))
+
+
 def _queued_lines(queued: QueuedJobs) -> list[Any]:
     lines: list[Any] = [Text("")]
     if queued.lab_partitions:
         count = sum(array_task_count(job.job_id) for job in queued.listed)
         lines.append(
-            Text(
-                f"Queued in {', '.join(queued.lab_partitions)}: "
-                f"{count} {'job' if count == 1 else 'jobs'}",
+            Text.assemble(
+                "Queued in ",
+                Text(", ").join(map(_partition_text, queued.lab_partitions)),
+                f": {count} {'job' if count == 1 else 'jobs'}",
                 style="bold",
             )
         )
@@ -162,14 +176,17 @@ def _queued_lines(queued: QueuedJobs) -> list[Any]:
         lines.append(
             Text.assemble(
                 "Queued in ",
-                ", ".join(f"{name}: {n}" for name, n in queued.shared_counts.items()),
+                Text(", ").join(
+                    Text.assemble(_partition_text(name), f": {n}")
+                    for name, n in queued.shared_counts.items()
+                ),
                 (" (shared, may run on other nodes)", "dim"),
             )
         )
     return lines
 
 
-def _queued_table(listed: Sequence[JobRecord]) -> Table:
+def _queued_table(listed: Sequence[JobRecord]) -> _PlainTable:
     # Array tasks and repeated submissions differ only by job ID; show them once.
     groups: dict[tuple[str, str, float, float, float, str], list[str]] = {}
     for job in listed:
@@ -183,55 +200,57 @@ def _queued_table(listed: Sequence[JobRecord]) -> Table:
         )
         groups.setdefault(key, []).append(job.job_id)
     show_reason = any(job.reason for job in listed)
-
-    table = Table(box=None, pad_edge=False, padding=(0, 1), header_style="bold white")
-    table.add_column("User", no_wrap=True, style="cyan")
-    table.add_column("Jobs", no_wrap=True, style="dim")
-    # The only column that shortens on a narrow terminal.
-    table.add_column("Partition", overflow="ellipsis")
-    for label in ("GPU", "CPU", "RAM"):
-        table.add_column(label, justify="right", no_wrap=True)
-    if show_reason:
-        table.add_column("Reason", no_wrap=True, style="dim")
+    rows = []
     for (user, partition, gpu, cpu, mem, reason), job_ids in groups.items():
         row = [
-            user,
-            job_ids[0]
-            if len(job_ids) == 1
-            else f"{sum(map(array_task_count, job_ids))} jobs",
-            partition,
-            _number(gpu) if gpu else "-",
-            _number(cpu) if cpu else "-",
-            f"{_number(mem)}G" if mem else "-",
+            (user, "cyan"),
+            (
+                job_ids[0]
+                if len(job_ids) == 1
+                else f"{sum(map(array_task_count, job_ids))} jobs",
+                "dim",
+            ),
+            (partition, _partition_color(partition)),
+            (_number(gpu) if gpu else "-", ""),
+            (_number(cpu) if cpu else "-", ""),
+            (f"{_number(mem)}G" if mem else "-", ""),
         ]
         if show_reason:
-            row.append(reason or "-")
-        table.add_row(*row)
-    return table
+            row.append((reason or "-", "dim"))
+        rows.append(row)
+    return _PlainTable(
+        ["User", "Jobs", "Partition", "GPU", "CPU", "RAM", *(["Reason"] if show_reason else [])],
+        rows,
+        right={"GPU", "CPU", "RAM"},
+        # Narrow terminals shorten, then drop, the reason and partition first.
+        shrink={"User", "Jobs", "Partition", "Reason"},
+        ellipsize={"Partition", "Reason"},
+        drop=["Reason", "Partition"] if show_reason else ["Partition"],
+    )
 
 
-def _running_table(allocations: Sequence[NodeAllocation]) -> Table:
-    table = Table(box=None, pad_edge=False, padding=(0, 1), header_style="bold white")
-    table.add_column("User", no_wrap=True, style="cyan")
-    table.add_column("Job", no_wrap=True, style="dim")
-    # The only column that shortens on a narrow terminal.
-    table.add_column("Partition", overflow="ellipsis")
-    for label in ("GPU", "CPU", "RAM"):
-        table.add_column(label, justify="right", no_wrap=True)
-    table.add_column("Elapsed", justify="right", no_wrap=True)
-    for allocation in allocations:
-        job = allocation.job
-        usage = allocation.usage
-        table.add_row(
-            job.user,
-            job.job_id,
-            job.partition,
-            _number(usage.gpu) if usage.gpu else "-",
-            _number(usage.cpu),
-            f"{_number(round(usage.mem))}G",
-            job.elapsed or "-",
-        )
-    return table
+def _running_table(allocations: Sequence[NodeAllocation]) -> _PlainTable:
+    rows = [
+        [
+            (allocation.job.user, "cyan"),
+            (allocation.job.job_id, "dim"),
+            (allocation.job.partition, _partition_color(allocation.job.partition)),
+            (_number(allocation.usage.gpu) if allocation.usage.gpu else "-", ""),
+            (_number(allocation.usage.cpu), ""),
+            (f"{_number(round(allocation.usage.mem))}G", ""),
+            (allocation.job.elapsed or "-", ""),
+        ]
+        for allocation in allocations
+    ]
+    return _PlainTable(
+        ["User", "Job", "Partition", "GPU", "CPU", "RAM", "Elapsed"],
+        rows,
+        right={"GPU", "CPU", "RAM", "Elapsed"},
+        # Narrow terminals shorten, then drop, the partition, then elapsed time.
+        shrink={"User", "Job", "Partition"},
+        ellipsize={"Partition"},
+        drop=["Partition", "Elapsed"],
+    )
 
 
 def node_json(
