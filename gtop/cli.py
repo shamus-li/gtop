@@ -38,7 +38,9 @@ from .history import (
     HistoryError,
     UsageHistory,
     cached_history,
+    fairshare_command,
     fetch_history,
+    parse_fairshare,
 )
 from .models import ClusterState, JobRecord, ServerState, UserUsage
 from .render import (
@@ -512,6 +514,20 @@ def _history_view(
             stderr_console.print(Text(str(error), style="red"))
             return EXIT_COMMAND_ERROR
 
+    users = target_users(args)
+    # Ranks and shares stay cluster-wide when -u or -m narrows the rows.
+    rows = [
+        (rank, user, hours)
+        for rank, (user, hours) in enumerate(history.ranked(), start=1)
+        if users is None or user in users
+    ][: args.limit]
+    fairshare = None
+    if users:
+        command = fairshare_command(users)
+        result = runner.run(command, DEFAULT_TIMEOUT)
+        if result.returncode != 0:
+            return _command_failed(stderr_console, "sshare", result)
+        fairshare = parse_fairshare(result.stdout)
     payload = {
         "view": f"users-{args.window}",
         "generated_at": history.generated_at,
@@ -522,15 +538,19 @@ def _history_view(
                 "user": user,
                 "total": round(hours, 1),
                 "accounts": history.accounts.get(user, []),
+                **(
+                    {"fairshare": fairshare.get(user, {})}
+                    if fairshare is not None
+                    else {}
+                ),
             }
-            for rank, (user, hours) in enumerate(
-                history.ranked()[: args.limit], start=1
-            )
+            for rank, user, hours in rows
         ],
     }
-    if not payload["users"]:
+    if not rows:
+        who = f" for {', '.join(sorted(users))}" if users else ""
         return _no_matches(
-            args, console, diagnostic_console, "No GPU usage in this window.", payload
+            args, console, diagnostic_console, f"No GPU usage{who} in this window.", payload
         )
     if args.json:
         _write_json_output(payload, console)
@@ -539,7 +559,8 @@ def _history_view(
         history,
         title=f"GPU use, last {args.window}",
         freshness=_freshness(args.window, history),
-        limit=args.limit,
+        top=[(user, hours) for _, user, hours in rows],
+        fairshare=fairshare,
         console=active_console,
     )
     return EXIT_SUCCESS

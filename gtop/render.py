@@ -563,14 +563,26 @@ def print_usage_history(
     *,
     title: str,
     freshness: Sequence[str],
-    limit: int,
+    top: Sequence[tuple[str, float]],
+    fairshare: Optional[dict[str, dict[str, float]]] = None,
     console: Optional[Any] = None,
 ) -> None:
     active_console = console or Console()
     ranked = history.ranked()
     grand_total = sum(history.gpu_hours.values())
-    top = ranked[:limit]
     labs = {user: ",".join(history.accounts.get(user, ())) for user, _ in top}
+    # One value per lab, in the Lab column's order; "-" where sshare shows none.
+    shares = (
+        {
+            user: ",".join(
+                f"{fairshare[user][lab]:.2f}" if lab in fairshare.get(user, {}) else "-"
+                for lab in history.accounts.get(user, ())
+            )
+            for user, _ in top
+        }
+        if fairshare is not None
+        else None
+    )
     include_full_name = _fits_width(
         getattr(active_console, "width", None),
         [
@@ -578,6 +590,7 @@ def print_usage_history(
             9,
             5,
             max(len(lab) for lab in labs.values()),
+            *([max(9, *(len(value) for value in shares.values()))] if shares else ()),
         ],
     )
 
@@ -586,12 +599,15 @@ def print_usage_history(
     table.add_column("GPU-hours", header_style="bold white", justify="right", no_wrap=True)
     table.add_column("Share", header_style="bold white", justify="right", no_wrap=True)
     table.add_column("Lab", header_style="bold white", no_wrap=True)
+    if shares is not None:
+        table.add_column("Fairshare", header_style="bold white", no_wrap=True)
     for user, total in top:
         table.add_row(
             Text(_top_user_label(user, include_full_name=include_full_name), style="cyan"),
             Text(f"{round(total):,}", style="bold yellow"),
             Text(f"{total / grand_total:.0%}", style=NODE_COUNT_COLOR),
             Text(labs[user], style=NODE_COUNT_COLOR),
+            *((Text(shares[user], style=NODE_COUNT_COLOR),) if shares is not None else ()),
         )
     active_console.print(Text(title, style="bold cyan"))
     for parts in (

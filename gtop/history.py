@@ -59,6 +59,35 @@ def history_command(window: str) -> Command:
     )
 
 
+def fairshare_command(users: set[str]) -> Command:
+    return (
+        "sshare",
+        "-U",
+        "-n",
+        "-P",
+        "-o",
+        "Account,User,FairShare",
+        "-u",
+        ",".join(sorted(users)),
+    )
+
+
+def parse_fairshare(output: str) -> dict[str, dict[str, float]]:
+    """FairShare per user and account. Clusters that keep usage private only
+    return the caller's own rows."""
+    fairshare: dict[str, dict[str, float]] = {}
+    for line in output.splitlines():
+        fields = line.split("|")
+        if len(fields) != 3:
+            continue
+        account, user, value = fields
+        try:
+            fairshare.setdefault(user, {})[account] = float(value)
+        except ValueError:
+            continue
+    return fairshare
+
+
 def parse_history(output: str, *, now: float) -> UsageHistory:
     gpu_hours: dict[str, float] = {}
     accounts: dict[str, set[str]] = {}

@@ -55,6 +55,7 @@ gtop users --week
 gtop users --month
 gtop users --year
 gtop users -n 50
+gtop users --week -m
 ```
 
 Who is using GPUs now, or GPU-hours per user and lab account over the last 7,
@@ -62,7 +63,9 @@ Who is using GPUs now, or GPU-hours per user and lab account over the last 7,
 at most 15 minutes old: the first run after that queries `sreport` again, which
 takes about 5 seconds for the week and 10 for the month. The year cache only
 updates when you add `--refresh`, which takes about 80 seconds. The list shows
-the top 25 users; `-n N` shows N.
+the top 25 users; `-n N` shows N. With `-m` or `-u`, only those users are
+listed, with their share of the whole cluster's GPU-hours and their SLURM
+fairshare per lab. Unicorn only shows fairshare for your own account.
 
 ```bash
 gtop jobs

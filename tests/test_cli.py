@@ -30,7 +30,7 @@ from gtop.constants import (
     SACCT_COMMAND,
     SQUEUE_COMMAND,
 )
-from gtop.history import history_command
+from gtop.history import fairshare_command, history_command
 from gtop.runner import Command, CommandResult
 from slurm_rows import node_row, sacct_row
 
@@ -1662,11 +1662,55 @@ def test_cli_node_detail_reports_unknown_node():
     assert "Unknown node: nope." in stream.getvalue()
 
 
-def test_cli_users_week_cannot_be_combined_with_me():
+def test_cli_users_history_filters_to_selected_users_with_rank_and_fairshare(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    command = history_command("week")
+    sreport_output = "\n".join(
+        [
+            "unicorn|alice|Alice A|lab|gres/gpu|30",
+            "unicorn|bob|Bob B|other|gres/gpu|40",
+            "unicorn|carol|Carol C|lab|gres/gpu|30",
+        ]
+    )
+    sshare = fairshare_command({"carol"})
+    stdout = RecordingConsole()
+
+    with (
+        patch("gtop.cli.cached_history", return_value=None),
+        patch("gtop.plan.getpass.getuser", return_value="carol"),
+    ):
+        code = cli_main(
+            ["users", "--week", "-m", "--json"],
+            runner=FakeRunner(
+                {
+                    command: make_result(command, sreport_output),
+                    sshare: make_result(sshare, "lab|carol|0.325810"),
+                }
+            ),
+            console=stdout,
+            stderr_console=RecordingConsole(),
+        )
+
+    payload = json.loads(stdout.calls[0][0][0])
+    assert code == EXIT_SUCCESS
+    assert payload["users"] == [
+        {
+            "rank": 3,
+            "user": "carol",
+            "total": 30.0,
+            "accounts": ["lab"],
+            "fairshare": {"lab": 0.32581},
+        },
+    ]
+
+
+def test_cli_users_week_cannot_be_combined_with_partition():
     runner = FakeRunner({})
 
     with pytest.raises(SystemExit) as excinfo:
-        cli_main(["users", "--week", "-m"], runner=runner)
+        cli_main(["users", "--week", "-p", "gpu"], runner=runner)
 
     assert excinfo.value.code == 2
     assert runner.calls == []

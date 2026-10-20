@@ -192,8 +192,8 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
                 f"gtop {command}" for command in commands
             ) + ")"
         parser.error(message)
-    if getattr(args, "window", None) and (args.users or args.me or args.partition):
-        parser.error("--week/--month/--year cannot be combined with -u, -m or -p")
+    if getattr(args, "window", None) and args.partition:
+        parser.error("--week/--month/--year cannot be combined with -p")
     if args.command == "nodes" and args.names and (
         args.tier != "all" or args.constraint or args.users or args.me or args.partition
     ):
