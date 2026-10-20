@@ -609,12 +609,18 @@ def print_usage_history(
             Text(labs[user], style=NODE_COUNT_COLOR),
             *((Text(shares[user], style=NODE_COUNT_COLOR),) if shares is not None else ()),
         )
-    active_console.print(Text(title, style="bold cyan"))
-    for parts in (
-        [f"{round(grand_total):,} GPU-hours", f"{len(ranked)} users"],
-        freshness,
-    ):
+    def print_line(parts: Sequence[str]) -> None:
         active_console.print(
             _Items([Text(part, style="dim") for part in parts], separator=" · ")
         )
+
+    totals = [f"{round(grand_total):,} GPU-hours", f"{len(ranked)} users"]
+    active_console.print(Text(title, style="bold cyan"))
+    # Fairshare is only fetched for -u/-m. Above those rows the cluster totals
+    # would read as the selected users' own, so they go below with a label.
+    if shares is None:
+        print_line(totals)
+    print_line(freshness)
     active_console.print(table)
+    if shares is not None:
+        print_line([f"Cluster total: {totals[0]}", totals[1]])
